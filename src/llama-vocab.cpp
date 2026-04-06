@@ -2325,6 +2325,14 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
             if (ml.get_key(LLM_KV_TOKENIZER_ADD_SEP, temp, false)) {
                 add_sep = temp;
             }
+
+            // workaround for Gemma 4
+            // ref: https://github.com/ggml-org/llama.cpp/pull/21500
+            if (pre_type == LLAMA_VOCAB_PRE_TYPE_GEMMA4 && !add_bos) {
+                add_bos = true;
+
+                LLAMA_LOG_WARN("%s: override '%s' to 'true' for Gemma4\n", __func__, kv(LLM_KV_TOKENIZER_ADD_BOS).c_str());
+            }
         }
 
         // auto-detect special tokens by text
@@ -2551,6 +2559,7 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
                     || t.first == "<|end_of_text|>"
                     || t.first == "<end_of_utterance>" // smoldocling
                     || t.first == "<turn|>" // gemma4
+                    || t.first == "<|tool_response>" // gemma4
                     || t.first == "<｜end▁of▁sentence｜>" // deepseek-ocr
                ) {
                 special_eog_ids.insert(t.second);
