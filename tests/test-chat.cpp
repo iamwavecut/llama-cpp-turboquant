@@ -3788,6 +3788,28 @@ static void test_developer_role_to_system_workaround() {
     }
 }
 
+static void test_gemma4_reasoning_without_system_prompt() {
+    auto tmpls = read_templates("models/templates/google-gemma-4-31B-it.jinja");
+
+    common_chat_templates_inputs inputs;
+    common_chat_msg              user_msg;
+    user_msg.role = "user";
+    user_msg.content = "Hello";
+    inputs.messages = { user_msg };
+    inputs.add_generation_prompt = true;
+    inputs.enable_thinking = true;
+
+    auto params = common_chat_templates_apply(tmpls.get(), inputs);
+    const std::string expected =
+        "<|turn>system\n"
+        "<|think|>You are a helpful assistant.<turn|>\n"
+        "<|turn>user\n"
+        "Hello<turn|>\n"
+        "<|turn>model\n";
+
+    assert_equals(expected, params.prompt);
+}
+
 static void test_msg_diffs_compute() {
     LOG_DBG("%s\n", __func__);
     {
@@ -3929,6 +3951,7 @@ int main(int argc, char ** argv) {
         test_msgs_oaicompat_json_conversion();
         test_tools_oaicompat_json_conversion();
         test_developer_role_to_system_workaround();
+        test_gemma4_reasoning_without_system_prompt();
         test_template_output_peg_parsers(detailed_debug);
         std::cout << "\n[chat] All tests passed!" << '\n';
     }
