@@ -32,6 +32,7 @@ add_library(llama
             llama-model.cpp
             llama-quant.cpp
             llama-sampler.cpp
+            llama-spectral.cpp
             llama-vocab.cpp
             unicode-data.cpp
             unicode.cpp
@@ -162,6 +163,16 @@ target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 target_link_libraries(llama PUBLIC ggml)
+
+if (APPLE AND GGML_ACCELERATE)
+    find_library(ACCELERATE_FRAMEWORK Accelerate)
+    if (ACCELERATE_FRAMEWORK)
+        target_compile_definitions(llama PRIVATE GGML_USE_ACCELERATE)
+        target_compile_definitions(llama PRIVATE ACCELERATE_NEW_LAPACK)
+        target_compile_definitions(llama PRIVATE ACCELERATE_LAPACK_ILP64)
+        target_link_libraries(llama PRIVATE ${ACCELERATE_FRAMEWORK})
+    endif()
+endif()
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)

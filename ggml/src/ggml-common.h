@@ -357,6 +357,55 @@ typedef struct {
 } block_tq4_1s;                         // 20 bytes total
 static_assert(sizeof(block_tq4_1s) == 20, "wrong tq4_1s block size");
 
+// SpectralQuant SQ2_0 / SQ3_1S / SQ4_1S:
+// spectral-domain weight quantization with per-tensor learned basis,
+// separate semantic/tail codebooks, and optional semantic correction.
+// The first GGML_SQ_CORR_MAX spectral coordinates can store a 4-bit residual.
+#define QK_SQ 32
+#define GGML_SQ_CORR_MAX 8
+#define GGML_SQ_CORR_BYTES (GGML_SQ_CORR_MAX / 2)
+
+typedef struct {
+    ggml_half dc;                     //  2 bytes: semantic correction scale
+    uint8_t   corr[GGML_SQ_CORR_BYTES]; //  4 bytes: signed 4-bit residuals for leading semantic coeffs
+    uint8_t   qs[QK_SQ / 4];          //  8 bytes: 2-bit packed indices
+} block_sq2_0;                        // 14 bytes total
+static_assert(sizeof(block_sq2_0) == 14, "wrong sq2_0 block size");
+
+typedef struct {
+    ggml_half dc;                     //  2 bytes
+    uint8_t   corr[GGML_SQ_CORR_BYTES]; //  4 bytes
+    uint8_t   qs[QK_SQ * 3 / 8];      // 12 bytes: 3-bit packed indices
+} block_sq3_1s;                       // 18 bytes total
+static_assert(sizeof(block_sq3_1s) == 18, "wrong sq3_1s block size");
+
+typedef struct {
+    ggml_half dc;                     //  2 bytes
+    uint8_t   corr[GGML_SQ_CORR_BYTES]; //  4 bytes
+    uint8_t   qs[QK_SQ / 2];          // 16 bytes: 4-bit packed indices
+} block_sq4_1s;                       // 22 bytes total
+static_assert(sizeof(block_sq4_1s) == 22, "wrong sq4_1s block size");
+
+// SpectralQuant SKV2_0 / SKV3_0 / SKV4_0:
+// spectral-domain KV-cache quantization. Per-row norms / QJL signs live in
+// runtime side-buffers, so the on-tensor payload is indices-only.
+#define QK_SKV 32
+
+typedef struct {
+    uint8_t qs[QK_SKV / 4];
+} block_skv2_0;
+static_assert(sizeof(block_skv2_0) == 8, "wrong skv2_0 block size");
+
+typedef struct {
+    uint8_t qs[QK_SKV * 3 / 8];
+} block_skv3_0;
+static_assert(sizeof(block_skv3_0) == 12, "wrong skv3_0 block size");
+
+typedef struct {
+    uint8_t qs[QK_SKV / 2];
+} block_skv4_0;
+static_assert(sizeof(block_skv4_0) == 16, "wrong skv4_0 block size");
+
 //
 // Super-block quantization structures
 //

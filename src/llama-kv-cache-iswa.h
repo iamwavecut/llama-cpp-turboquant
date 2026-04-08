@@ -17,6 +17,8 @@ public:
             const llama_model & model,
                     ggml_type   type_k,
                     ggml_type   type_v,
+    const llama_spectral_artifact * spectral_artifact,
+                  const char * spectral_profile,
                          bool   v_trans,
                          bool   offload,
                          bool   swa_full,

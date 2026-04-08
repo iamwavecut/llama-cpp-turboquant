@@ -12,9 +12,21 @@
 
 #define _USE_MATH_DEFINES
 #include <math.h>
+#include <inttypes.h>
 #include <string.h>
 #include <assert.h>
 #include <stdlib.h>
+#include <float.h>
+
+#if defined(GGML_USE_ACCELERATE)
+#include <Accelerate/Accelerate.h>
+#endif
+
+#if defined(_MSC_VER)
+#define GGML_THREAD_LOCAL __declspec(thread)
+#else
+#define GGML_THREAD_LOCAL __thread
+#endif
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -992,4 +1004,1214 @@ size_t quantize_tq4_1s(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst
         );
     }
     return nrows * row_size;
+}
+
+/* ----------------------------------------------------------------------- */
+/* SpectralQuant SQ2_0 / SQ3_1S / SQ4_1S                                   */
+/* ----------------------------------------------------------------------- */
+
+struct ggml_spectral_registry_entry {
+    const void * owner;
+    const uint8_t * data;
+    size_t size;
+    enum ggml_type type;
+    struct ggml_spectral_weight_meta meta;
+};
+
+static struct ggml_spectral_registry_entry * ggml_spectral_registry = NULL;
+static size_t ggml_spectral_registry_size = 0;
+static size_t ggml_spectral_registry_capacity = 0;
+
+bool ggml_is_spectral_weight_type(enum ggml_type type) {
+    return type == GGML_TYPE_SQ2_0 || type == GGML_TYPE_SQ3_1S || type == GGML_TYPE_SQ4_1S;
+}
+
+static int ggml_sq_bits(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_SQ2_0:  return 2;
+        case GGML_TYPE_SQ3_1S: return 3;
+        case GGML_TYPE_SQ4_1S: return 4;
+        default:               return 0;
+    }
+}
+
+static size_t ggml_sq_row_size(enum ggml_type type, uint32_t dim) {
+    return ggml_row_size(type, dim);
+}
+
+static size_t ggml_sq_qs_bytes(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_SQ2_0:  return sizeof(((block_sq2_0 *) 0)->qs);
+        case GGML_TYPE_SQ3_1S: return sizeof(((block_sq3_1s *) 0)->qs);
+        case GGML_TYPE_SQ4_1S: return sizeof(((block_sq4_1s *) 0)->qs);
+        default:               return 0;
+    }
+}
+
+static ggml_half * ggml_sq_corr_scale_ptr(void * block, enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_SQ2_0:  return &((block_sq2_0 *) block)->dc;
+        case GGML_TYPE_SQ3_1S: return &((block_sq3_1s *) block)->dc;
+        case GGML_TYPE_SQ4_1S: return &((block_sq4_1s *) block)->dc;
+        default:               return NULL;
+    }
+}
+
+static const ggml_half * ggml_sq_corr_scale_ptr_const(const void * block, enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_SQ2_0:  return &((const block_sq2_0 *) block)->dc;
+        case GGML_TYPE_SQ3_1S: return &((const block_sq3_1s *) block)->dc;
+        case GGML_TYPE_SQ4_1S: return &((const block_sq4_1s *) block)->dc;
+        default:               return NULL;
+    }
+}
+
+static uint8_t * ggml_sq_corr_ptr(void * block, enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_SQ2_0:  return ((block_sq2_0 *) block)->corr;
+        case GGML_TYPE_SQ3_1S: return ((block_sq3_1s *) block)->corr;
+        case GGML_TYPE_SQ4_1S: return ((block_sq4_1s *) block)->corr;
+        default:               return NULL;
+    }
+}
+
+static const uint8_t * ggml_sq_corr_ptr_const(const void * block, enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_SQ2_0:  return ((const block_sq2_0 *) block)->corr;
+        case GGML_TYPE_SQ3_1S: return ((const block_sq3_1s *) block)->corr;
+        case GGML_TYPE_SQ4_1S: return ((const block_sq4_1s *) block)->corr;
+        default:               return NULL;
+    }
+}
+
+static uint8_t * ggml_sq_qs_ptr(void * block, enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_SQ2_0:  return ((block_sq2_0 *) block)->qs;
+        case GGML_TYPE_SQ3_1S: return ((block_sq3_1s *) block)->qs;
+        case GGML_TYPE_SQ4_1S: return ((block_sq4_1s *) block)->qs;
+        default:               return NULL;
+    }
+}
+
+static const uint8_t * ggml_sq_qs_ptr_const(const void * block, enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_SQ2_0:  return ((const block_sq2_0 *) block)->qs;
+        case GGML_TYPE_SQ3_1S: return ((const block_sq3_1s *) block)->qs;
+        case GGML_TYPE_SQ4_1S: return ((const block_sq4_1s *) block)->qs;
+        default:               return NULL;
+    }
+}
+
+static bool ggml_sq_meta_valid(const struct ggml_spectral_weight_meta * meta, enum ggml_type type) {
+    const int bits = ggml_sq_bits(type);
+    if (bits == 0 || meta == NULL) {
+        return false;
+    }
+    if (meta->dim == 0 || meta->dim % QK_SQ != 0) {
+        return false;
+    }
+    if (meta->split == 0 || meta->split > meta->dim) {
+        return false;
+    }
+    if (meta->correction_dim > GGML_SQ_CORR_MAX || meta->correction_dim > meta->split) {
+        return false;
+    }
+    if (meta->semantic_codebook_size == 0 || meta->tail_codebook_size == 0) {
+        return false;
+    }
+    if (meta->semantic_codebook_size > (uint32_t) (1u << bits) || meta->tail_codebook_size > (uint32_t) (1u << bits)) {
+        return false;
+    }
+    return meta->basis != NULL && meta->semantic_codebook != NULL && meta->tail_codebook != NULL;
+}
+
+static uint32_t ggml_sq_quantize_scalar(float value, const float * codebook, uint32_t n_levels) {
+    uint32_t best = 0;
+    float best_dist = FLT_MAX;
+    for (uint32_t i = 0; i < n_levels; ++i) {
+        const float dist = fabsf(value - codebook[i]);
+        if (dist < best_dist) {
+            best_dist = dist;
+            best = i;
+        }
+    }
+    return best;
+}
+
+static void ggml_sq_pack_index(uint8_t * qs, int idx, int bits, uint32_t code) {
+    const int bit_pos = idx * bits;
+    const int byte_pos = bit_pos / 8;
+    const int bit_off = bit_pos % 8;
+    const uint32_t mask = (uint32_t) ((1u << bits) - 1u);
+
+    uint32_t v = (code & mask) << bit_off;
+    qs[byte_pos] |= (uint8_t) (v & 0xFFu);
+    if (bit_off + bits > 8) {
+        qs[byte_pos + 1] |= (uint8_t) ((v >> 8) & 0xFFu);
+    }
+}
+
+static uint32_t ggml_sq_unpack_index(const uint8_t * qs, int idx, int bits) {
+    const int bit_pos = idx * bits;
+    const int byte_pos = bit_pos / 8;
+    const int bit_off = bit_pos % 8;
+    uint32_t v = (uint32_t) (qs[byte_pos] >> bit_off);
+    if (bit_off + bits > 8) {
+        v |= (uint32_t) qs[byte_pos + 1] << (8 - bit_off);
+    }
+    return v & ((1u << bits) - 1u);
+}
+
+static void ggml_sq_store_corr(uint8_t * corr, int idx, int8_t q) {
+    const uint8_t nibble = (uint8_t) (q & 0x0F);
+    corr[idx / 2] &= (uint8_t) ~(0x0Fu << ((idx & 1) * 4));
+    corr[idx / 2] |= (uint8_t) (nibble << ((idx & 1) * 4));
+}
+
+static int8_t ggml_sq_load_corr(const uint8_t * corr, int idx) {
+    const uint8_t nibble = (corr[idx / 2] >> ((idx & 1) * 4)) & 0x0F;
+    return (int8_t) (nibble >= 8 ? (int) nibble - 16 : nibble);
+}
+
+static void ggml_sq_forward_rotate(const struct ggml_spectral_weight_meta * meta, const float * input, float * rotated) {
+#if defined(GGML_USE_ACCELERATE)
+    cblas_sgemv(
+            CblasRowMajor,
+            CblasTrans,
+            (int) meta->dim,
+            (int) meta->dim,
+            1.0f,
+            meta->basis,
+            (int) meta->dim,
+            input,
+            1,
+            0.0f,
+            rotated,
+            1);
+#else
+    for (uint32_t col = 0; col < meta->dim; ++col) {
+        float acc = 0.0f;
+        for (uint32_t row = 0; row < meta->dim; ++row) {
+            acc += meta->basis[(size_t) row * meta->dim + col] * input[row];
+        }
+        rotated[col] = acc;
+    }
+#endif
+}
+
+static void ggml_sq_inverse_rotate(const struct ggml_spectral_weight_meta * meta, const float * rotated, float * output) {
+#if defined(GGML_USE_ACCELERATE)
+    cblas_sgemv(
+            CblasRowMajor,
+            CblasNoTrans,
+            (int) meta->dim,
+            (int) meta->dim,
+            1.0f,
+            meta->basis,
+            (int) meta->dim,
+            rotated,
+            1,
+            0.0f,
+            output,
+            1);
+#else
+    for (uint32_t row = 0; row < meta->dim; ++row) {
+        float acc = 0.0f;
+        for (uint32_t col = 0; col < meta->dim; ++col) {
+            acc += meta->basis[(size_t) row * meta->dim + col] * rotated[col];
+        }
+        output[row] = acc;
+    }
+#endif
+}
+
+static void ggml_sq_quantize_row(
+        enum ggml_type type,
+        const struct ggml_spectral_weight_meta * meta,
+        const float * x,
+        void * y) {
+    const int bits = ggml_sq_bits(type);
+    const size_t block_size = ggml_type_size(type);
+    const uint32_t correction_dim = meta->correction_dim;
+    float * rotated = (float *) malloc((size_t) meta->dim * sizeof(float));
+    GGML_ASSERT(rotated != NULL);
+
+    ggml_sq_forward_rotate(meta, x, rotated);
+
+    for (uint32_t block = 0; block < meta->dim / QK_SQ; ++block) {
+        uint8_t * block_ptr = (uint8_t *) y + block * block_size;
+        uint8_t * qs = ggml_sq_qs_ptr(block_ptr, type);
+        uint8_t * corr = ggml_sq_corr_ptr(block_ptr, type);
+        ggml_half * dc = ggml_sq_corr_scale_ptr(block_ptr, type);
+
+        memset(qs, 0, ggml_sq_qs_bytes(type));
+        memset(corr, 0, GGML_SQ_CORR_BYTES);
+        *dc = GGML_FP32_TO_FP16(0.0f);
+
+        float residuals[GGML_SQ_CORR_MAX] = { 0 };
+        float max_abs_residual = 0.0f;
+
+        for (uint32_t j = 0; j < QK_SQ; ++j) {
+            const uint32_t idx = block * QK_SQ + j;
+            const bool semantic = idx < meta->split;
+            const float * codebook = semantic ? meta->semantic_codebook : meta->tail_codebook;
+            const uint32_t n_levels = semantic ? meta->semantic_codebook_size : meta->tail_codebook_size;
+            const uint32_t code = ggml_sq_quantize_scalar(rotated[idx], codebook, n_levels);
+            ggml_sq_pack_index(qs, (int) j, bits, code);
+
+            if (idx < correction_dim) {
+                const float residual = rotated[idx] - codebook[code];
+                residuals[idx] = residual;
+                if (fabsf(residual) > max_abs_residual) {
+                    max_abs_residual = fabsf(residual);
+                }
+            }
+        }
+
+        if (max_abs_residual > 0.0f) {
+            const float corr_scale = max_abs_residual / 7.0f;
+            *dc = GGML_FP32_TO_FP16(corr_scale);
+            for (uint32_t j = 0; j < correction_dim; ++j) {
+                const uint32_t idx = block * QK_SQ + j;
+                if (idx >= correction_dim) {
+                    break;
+                }
+                int q = corr_scale > 0.0f ? (int) lrintf(residuals[idx] / corr_scale) : 0;
+                if (q < -7) q = -7;
+                if (q >  7) q =  7;
+                ggml_sq_store_corr(corr, (int) j, (int8_t) q);
+            }
+        }
+    }
+
+    free(rotated);
+}
+
+static void ggml_sq_dequantize_rows(
+        enum ggml_type type,
+        const struct ggml_spectral_registry_entry * reg,
+        const uint8_t * src,
+        float * dst,
+        int64_t n) {
+    const struct ggml_spectral_weight_meta * meta = &reg->meta;
+    const int bits = ggml_sq_bits(type);
+    const size_t row_size = ggml_sq_row_size(type, meta->dim);
+    const size_t row_offset = (size_t) (src - reg->data);
+    GGML_ASSERT(row_offset % row_size == 0);
+    GGML_ASSERT(n % meta->dim == 0);
+
+    const int64_t nrows = n / meta->dim;
+    float * rotated = (float *) malloc((size_t) meta->dim * sizeof(float));
+    GGML_ASSERT(rotated != NULL);
+
+    for (int64_t row = 0; row < nrows; ++row) {
+        const uint8_t * row_ptr = src + row * row_size;
+        memset(rotated, 0, (size_t) meta->dim * sizeof(float));
+
+        for (uint32_t block = 0; block < meta->dim / QK_SQ; ++block) {
+            const uint8_t * block_ptr = row_ptr + block * ggml_type_size(type);
+            const uint8_t * qs = ggml_sq_qs_ptr_const(block_ptr, type);
+            const uint8_t * corr = ggml_sq_corr_ptr_const(block_ptr, type);
+            const float corr_scale = GGML_FP16_TO_FP32(*ggml_sq_corr_scale_ptr_const(block_ptr, type));
+
+            for (uint32_t j = 0; j < QK_SQ; ++j) {
+                const uint32_t idx = block * QK_SQ + j;
+                const bool semantic = idx < meta->split;
+                const float * codebook = semantic ? meta->semantic_codebook : meta->tail_codebook;
+                const uint32_t n_levels = semantic ? meta->semantic_codebook_size : meta->tail_codebook_size;
+                uint32_t code = ggml_sq_unpack_index(qs, (int) j, bits);
+                if (code >= n_levels) {
+                    code = n_levels - 1;
+                }
+                rotated[idx] = codebook[code];
+            }
+
+            if (block == 0 && meta->correction_dim > 0 && corr_scale > 0.0f) {
+                for (uint32_t j = 0; j < meta->correction_dim; ++j) {
+                    rotated[j] += corr_scale * ggml_sq_load_corr(corr, (int) j);
+                }
+            }
+        }
+
+        ggml_sq_inverse_rotate(meta, rotated, dst + row * meta->dim);
+    }
+
+    free(rotated);
+}
+
+static const struct ggml_spectral_registry_entry * ggml_sq_lookup_registry(const void * data, enum ggml_type type) {
+    const uint8_t * ptr = (const uint8_t *) data;
+    for (size_t i = 0; i < ggml_spectral_registry_size; ++i) {
+        const struct ggml_spectral_registry_entry * entry = &ggml_spectral_registry[i];
+        if (entry->type != type) {
+            continue;
+        }
+        if (ptr >= entry->data && ptr < entry->data + entry->size) {
+            return entry;
+        }
+    }
+    return NULL;
+}
+
+static void ggml_sq_dequantize(
+        enum ggml_type type,
+        const void * x,
+        float * y,
+        int64_t k) {
+    const struct ggml_spectral_registry_entry * reg = ggml_sq_lookup_registry(x, type);
+    GGML_ASSERT(reg != NULL && "missing spectral tensor runtime metadata");
+    ggml_sq_dequantize_rows(type, reg, (const uint8_t *) x, y, k);
+}
+
+struct ggml_sq_rot_cache {
+    const struct ggml_spectral_weight_meta * meta;
+    const float * input_ptr;
+    int64_t n;
+    size_t capacity;
+    float * rotated;
+    float * lut;
+};
+
+static GGML_THREAD_LOCAL struct ggml_sq_rot_cache ggml_sq_rot_cache = { 0 };
+
+#define GGML_SQ_LUT_LEVELS 16
+
+void ggml_sq_vec_cache_reset(void) {
+    ggml_sq_rot_cache.meta = NULL;
+    ggml_sq_rot_cache.input_ptr = NULL;
+    ggml_sq_rot_cache.n = 0;
+}
+
+static bool ggml_sq_rot_cache_ensure(size_t n) {
+    if (ggml_sq_rot_cache.capacity >= n) {
+        return true;
+    }
+
+    float * new_rotated = (float *) malloc(n * sizeof(float));
+    if (new_rotated == NULL) {
+        return false;
+    }
+
+    float * new_lut = (float *) malloc(n * GGML_SQ_LUT_LEVELS * sizeof(float));
+    if (new_lut == NULL) {
+        free(new_rotated);
+        return false;
+    }
+
+    free(ggml_sq_rot_cache.rotated);
+    free(ggml_sq_rot_cache.lut);
+    ggml_sq_rot_cache.rotated = new_rotated;
+    ggml_sq_rot_cache.lut = new_lut;
+    ggml_sq_rot_cache.capacity = n;
+    ggml_sq_rot_cache.meta = NULL;
+    ggml_sq_rot_cache.input_ptr = NULL;
+    ggml_sq_rot_cache.n = 0;
+    return true;
+}
+
+static void ggml_sq_build_lookup_table(
+        const struct ggml_spectral_weight_meta * meta,
+        const float * rotated,
+        float * lut) {
+    for (uint32_t idx = 0; idx < meta->dim; ++idx) {
+        const bool semantic = idx < meta->split;
+        const float * codebook = semantic ? meta->semantic_codebook : meta->tail_codebook;
+        const uint32_t n_levels = semantic ? meta->semantic_codebook_size : meta->tail_codebook_size;
+        const uint32_t last = n_levels - 1;
+        float * row_lut = lut + (size_t) idx * GGML_SQ_LUT_LEVELS;
+        const float v = rotated[idx];
+
+        for (uint32_t code = 0; code < GGML_SQ_LUT_LEVELS; ++code) {
+            const uint32_t clamped = code < n_levels ? code : last;
+            row_lut[code] = v * codebook[clamped];
+        }
+    }
+}
+
+static bool ggml_sq_prepare_rotated_input(
+        const struct ggml_spectral_registry_entry * reg,
+        const float * GGML_RESTRICT vy,
+        int64_t n,
+        const float ** rotated_out,
+        const float ** lut_out) {
+    if (reg == NULL || vy == NULL || rotated_out == NULL || lut_out == NULL) {
+        return false;
+    }
+    if (n <= 0 || n != (int64_t) reg->meta.dim) {
+        return false;
+    }
+    if (!ggml_sq_rot_cache_ensure((size_t) n)) {
+        return false;
+    }
+
+    if (ggml_sq_rot_cache.meta != &reg->meta ||
+            ggml_sq_rot_cache.n != n ||
+            ggml_sq_rot_cache.input_ptr != vy) {
+        ggml_sq_forward_rotate(&reg->meta, vy, ggml_sq_rot_cache.rotated);
+        ggml_sq_build_lookup_table(&reg->meta, ggml_sq_rot_cache.rotated, ggml_sq_rot_cache.lut);
+        ggml_sq_rot_cache.meta = &reg->meta;
+        ggml_sq_rot_cache.input_ptr = vy;
+        ggml_sq_rot_cache.n = n;
+    }
+
+    *rotated_out = ggml_sq_rot_cache.rotated;
+    *lut_out = ggml_sq_rot_cache.lut;
+    return true;
+}
+
+static float ggml_sq_dot_row_correction(
+        enum ggml_type type,
+        const struct ggml_spectral_weight_meta * meta,
+        const uint8_t * row_ptr,
+        const float * rotated) {
+    if (meta->correction_dim == 0) {
+        return 0.0f;
+    }
+
+    const uint8_t * corr = ggml_sq_corr_ptr_const(row_ptr, type);
+    const float corr_scale = GGML_FP16_TO_FP32(*ggml_sq_corr_scale_ptr_const(row_ptr, type));
+    if (corr_scale <= 0.0f) {
+        return 0.0f;
+    }
+
+    float sum = 0.0f;
+    for (uint32_t j = 0; j < meta->correction_dim; ++j) {
+        sum += corr_scale * ggml_sq_load_corr(corr, (int) j) * rotated[j];
+    }
+    return sum;
+}
+
+static float ggml_sq_dot_row_sq2_0(
+        const struct ggml_spectral_weight_meta * meta,
+        const uint8_t * row_ptr,
+        const float * lut,
+        const float * rotated) {
+    float sum = 0.0f;
+
+    for (uint32_t block = 0; block < meta->dim / QK_SQ; ++block) {
+        const uint8_t * block_ptr = row_ptr + block * ggml_type_size(GGML_TYPE_SQ2_0);
+        const uint8_t * qs = ggml_sq_qs_ptr_const(block_ptr, GGML_TYPE_SQ2_0);
+        const float * block_lut = lut + (size_t) block * QK_SQ * GGML_SQ_LUT_LEVELS;
+
+        for (uint32_t j = 0; j < QK_SQ / 4; ++j) {
+            const uint8_t packed = qs[j];
+            sum += block_lut[(size_t) (4 * j + 0) * GGML_SQ_LUT_LEVELS + ((packed >> 0) & 0x03)];
+            sum += block_lut[(size_t) (4 * j + 1) * GGML_SQ_LUT_LEVELS + ((packed >> 2) & 0x03)];
+            sum += block_lut[(size_t) (4 * j + 2) * GGML_SQ_LUT_LEVELS + ((packed >> 4) & 0x03)];
+            sum += block_lut[(size_t) (4 * j + 3) * GGML_SQ_LUT_LEVELS + ((packed >> 6) & 0x03)];
+        }
+    }
+
+    return sum + ggml_sq_dot_row_correction(GGML_TYPE_SQ2_0, meta, row_ptr, rotated);
+}
+
+static float ggml_sq_dot_row_sq3_1s(
+        const struct ggml_spectral_weight_meta * meta,
+        const uint8_t * row_ptr,
+        const float * lut,
+        const float * rotated) {
+    float sum = 0.0f;
+
+    for (uint32_t block = 0; block < meta->dim / QK_SQ; ++block) {
+        const uint8_t * block_ptr = row_ptr + block * ggml_type_size(GGML_TYPE_SQ3_1S);
+        const uint8_t * qs = ggml_sq_qs_ptr_const(block_ptr, GGML_TYPE_SQ3_1S);
+        const float * block_lut = lut + (size_t) block * QK_SQ * GGML_SQ_LUT_LEVELS;
+        uint32_t bitbuf = 0;
+        int bits_in_buf = 0;
+        const uint8_t * p = qs;
+
+        for (uint32_t j = 0; j < QK_SQ; ++j) {
+            while (bits_in_buf < 3) {
+                bitbuf |= (uint32_t) (*p++) << bits_in_buf;
+                bits_in_buf += 8;
+            }
+            const uint32_t code = bitbuf & 0x07u;
+            bitbuf >>= 3;
+            bits_in_buf -= 3;
+            sum += block_lut[(size_t) j * GGML_SQ_LUT_LEVELS + code];
+        }
+    }
+
+    return sum + ggml_sq_dot_row_correction(GGML_TYPE_SQ3_1S, meta, row_ptr, rotated);
+}
+
+static float ggml_sq_dot_row_sq4_1s(
+        const struct ggml_spectral_weight_meta * meta,
+        const uint8_t * row_ptr,
+        const float * lut,
+        const float * rotated) {
+    float sum = 0.0f;
+
+    for (uint32_t block = 0; block < meta->dim / QK_SQ; ++block) {
+        const uint8_t * block_ptr = row_ptr + block * ggml_type_size(GGML_TYPE_SQ4_1S);
+        const uint8_t * qs = ggml_sq_qs_ptr_const(block_ptr, GGML_TYPE_SQ4_1S);
+        const float * block_lut = lut + (size_t) block * QK_SQ * GGML_SQ_LUT_LEVELS;
+
+        for (uint32_t j = 0; j < QK_SQ / 2; ++j) {
+            const uint8_t packed = qs[j];
+            sum += block_lut[(size_t) (2 * j + 0) * GGML_SQ_LUT_LEVELS + (packed & 0x0Fu)];
+            sum += block_lut[(size_t) (2 * j + 1) * GGML_SQ_LUT_LEVELS + (packed >> 4)];
+        }
+    }
+
+    return sum + ggml_sq_dot_row_correction(GGML_TYPE_SQ4_1S, meta, row_ptr, rotated);
+}
+
+static float ggml_sq_dot_row(
+        enum ggml_type type,
+        const struct ggml_spectral_weight_meta * meta,
+        const uint8_t * row_ptr,
+        const float * lut,
+        const float * rotated) {
+    switch (type) {
+        case GGML_TYPE_SQ2_0:
+            return ggml_sq_dot_row_sq2_0(meta, row_ptr, lut, rotated);
+        case GGML_TYPE_SQ3_1S:
+            return ggml_sq_dot_row_sq3_1s(meta, row_ptr, lut, rotated);
+        case GGML_TYPE_SQ4_1S:
+            return ggml_sq_dot_row_sq4_1s(meta, row_ptr, lut, rotated);
+        default:
+            return 0.0f;
+    }
+}
+
+bool ggml_sq_vec_dot_f32(
+        enum ggml_type type,
+        const void * GGML_RESTRICT vx,
+        const float * GGML_RESTRICT vy,
+        int64_t n,
+        float * GGML_RESTRICT s) {
+    const struct ggml_spectral_registry_entry * reg = ggml_sq_lookup_registry(vx, type);
+    if (reg == NULL || s == NULL || vy == NULL) {
+        return false;
+    }
+
+    const float * rotated = NULL;
+    const float * lut = NULL;
+    if (!ggml_sq_prepare_rotated_input(reg, vy, n, &rotated, &lut)) {
+        return false;
+    }
+
+    *s = ggml_sq_dot_row(type, &reg->meta, (const uint8_t *) vx, lut, rotated);
+    return true;
+}
+
+void dequantize_row_sq2_0(const block_sq2_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    ggml_sq_dequantize(GGML_TYPE_SQ2_0, x, y, k);
+}
+
+void dequantize_row_sq3_1s(const block_sq3_1s * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    ggml_sq_dequantize(GGML_TYPE_SQ3_1S, x, y, k);
+}
+
+void dequantize_row_sq4_1s(const block_sq4_1s * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    ggml_sq_dequantize(GGML_TYPE_SQ4_1S, x, y, k);
+}
+
+size_t ggml_quantize_spectral_weight(
+        enum ggml_type type,
+        const float * src,
+        void * dst,
+        int64_t nrows,
+        int64_t n_per_row,
+        const struct ggml_spectral_weight_meta * meta) {
+    if (!ggml_is_spectral_weight_type(type) || !ggml_sq_meta_valid(meta, type)) {
+        return 0;
+    }
+    if (nrows <= 0 || n_per_row <= 0 || n_per_row != (int64_t) meta->dim) {
+        return 0;
+    }
+
+    const size_t row_size = ggml_sq_row_size(type, meta->dim);
+    for (int64_t row = 0; row < nrows; ++row) {
+        ggml_sq_quantize_row(type, meta, src + row * n_per_row, (uint8_t *) dst + row * row_size);
+    }
+    return (size_t) nrows * row_size;
+}
+
+bool ggml_spectral_register_tensor(
+        const void * owner,
+        const void * data,
+        size_t size,
+        enum ggml_type type,
+        const struct ggml_spectral_weight_meta * meta) {
+    if (!ggml_is_spectral_weight_type(type) || !ggml_sq_meta_valid(meta, type) || data == NULL || size == 0) {
+        return false;
+    }
+
+    for (size_t i = 0; i < ggml_spectral_registry_size; ++i) {
+        if (ggml_spectral_registry[i].data == (const uint8_t *) data) {
+            ggml_spectral_registry[i].owner = owner;
+            ggml_spectral_registry[i].size = size;
+            ggml_spectral_registry[i].type = type;
+            ggml_spectral_registry[i].meta = *meta;
+            return true;
+        }
+    }
+
+    if (ggml_spectral_registry_size == ggml_spectral_registry_capacity) {
+        const size_t new_capacity = ggml_spectral_registry_capacity == 0 ? 16 : ggml_spectral_registry_capacity * 2;
+        struct ggml_spectral_registry_entry * new_entries = (struct ggml_spectral_registry_entry *) realloc(
+                ggml_spectral_registry, new_capacity * sizeof(struct ggml_spectral_registry_entry));
+        if (new_entries == NULL) {
+            return false;
+        }
+        ggml_spectral_registry = new_entries;
+        ggml_spectral_registry_capacity = new_capacity;
+    }
+
+    ggml_spectral_registry[ggml_spectral_registry_size++] = (struct ggml_spectral_registry_entry) {
+        .owner = owner,
+        .data = (const uint8_t *) data,
+        .size = size,
+        .type = type,
+        .meta = *meta,
+    };
+    return true;
+}
+
+void ggml_spectral_unregister_owner(const void * owner) {
+    if (owner == NULL || ggml_spectral_registry_size == 0) {
+        return;
+    }
+
+    size_t dst = 0;
+    for (size_t src = 0; src < ggml_spectral_registry_size; ++src) {
+        if (ggml_spectral_registry[src].owner != owner) {
+            if (dst != src) {
+                ggml_spectral_registry[dst] = ggml_spectral_registry[src];
+            }
+            ++dst;
+        }
+    }
+    ggml_spectral_registry_size = dst;
+}
+
+/* ----------------------------------------------------------------------- */
+/* SpectralQuant SKV2_0 / SKV3_0 / SKV4_0                                   */
+/* ----------------------------------------------------------------------- */
+
+struct ggml_spectral_kv_registry_entry {
+    const void * owner;
+    uint8_t * data;
+    size_t size;
+    enum ggml_type type;
+    struct ggml_spectral_kv_meta meta;
+};
+
+static struct ggml_spectral_kv_registry_entry * ggml_spectral_kv_registry = NULL;
+static size_t ggml_spectral_kv_registry_size = 0;
+static size_t ggml_spectral_kv_registry_capacity = 0;
+
+bool ggml_is_spectral_kv_type(enum ggml_type type) {
+    return type == GGML_TYPE_SKV2_0 || type == GGML_TYPE_SKV3_0 || type == GGML_TYPE_SKV4_0;
+}
+
+static int ggml_skv_bits(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_SKV2_0: return 2;
+        case GGML_TYPE_SKV3_0: return 3;
+        case GGML_TYPE_SKV4_0: return 4;
+        default:               return 0;
+    }
+}
+
+static size_t ggml_skv_qs_bytes(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_SKV2_0: return sizeof(((block_skv2_0 *) 0)->qs);
+        case GGML_TYPE_SKV3_0: return sizeof(((block_skv3_0 *) 0)->qs);
+        case GGML_TYPE_SKV4_0: return sizeof(((block_skv4_0 *) 0)->qs);
+        default:               return 0;
+    }
+}
+
+static uint8_t * ggml_skv_qs_ptr(void * block, enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_SKV2_0: return ((block_skv2_0 *) block)->qs;
+        case GGML_TYPE_SKV3_0: return ((block_skv3_0 *) block)->qs;
+        case GGML_TYPE_SKV4_0: return ((block_skv4_0 *) block)->qs;
+        default:               return NULL;
+    }
+}
+
+static const uint8_t * ggml_skv_qs_ptr_const(const void * block, enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_SKV2_0: return ((const block_skv2_0 *) block)->qs;
+        case GGML_TYPE_SKV3_0: return ((const block_skv3_0 *) block)->qs;
+        case GGML_TYPE_SKV4_0: return ((const block_skv4_0 *) block)->qs;
+        default:               return NULL;
+    }
+}
+
+static bool ggml_skv_meta_valid(const struct ggml_spectral_kv_meta * meta, enum ggml_type type) {
+    if (meta == NULL || !ggml_is_spectral_kv_type(type)) {
+        return false;
+    }
+    if (meta->n_head == 0 || meta->head_dim == 0 || meta->head_dim_padded < meta->head_dim) {
+        return false;
+    }
+    if (meta->head_dim_padded % QK_SKV != 0 || meta->n_rows == 0 || meta->heads == NULL || meta->vec_norms == NULL) {
+        return false;
+    }
+    if (meta->use_correction && meta->is_key) {
+        if (meta->residual_norms == NULL || meta->qjl_signs == NULL || meta->qjl_bytes_per_head == 0) {
+            return false;
+        }
+    }
+    for (uint32_t h = 0; h < meta->n_head; ++h) {
+        const struct ggml_spectral_kv_head_meta * head = &meta->heads[h];
+        const uint32_t max_levels = (uint32_t) (1u << ggml_skv_bits(type));
+        if (head->dim != meta->head_dim || head->split == 0 || head->split > head->dim) {
+            return false;
+        }
+        if (head->semantic_codebook_size == 0 || head->tail_codebook_size == 0) {
+            return false;
+        }
+        if (head->semantic_codebook_size > max_levels || head->tail_codebook_size > max_levels) {
+            return false;
+        }
+        if (head->basis == NULL || head->semantic_codebook == NULL || head->tail_codebook == NULL) {
+            return false;
+        }
+        if (meta->use_correction && meta->is_key && head->qjl_matrix == NULL) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void ggml_skv_store_sign(uint8_t * dst, uint32_t idx, int positive) {
+    const uint8_t bit = positive ? 1u : 0u;
+    dst[idx / 8] &= (uint8_t) ~(1u << (idx & 7));
+    dst[idx / 8] |= (uint8_t) (bit << (idx & 7));
+}
+
+static int ggml_skv_load_sign(const uint8_t * src, uint32_t idx) {
+    return ((src[idx / 8] >> (idx & 7)) & 1u) ? 1 : -1;
+}
+
+static const struct ggml_spectral_kv_registry_entry * ggml_skv_lookup_registry(
+        const void * data,
+        enum ggml_type type,
+        uint32_t * row_index,
+        uint32_t * head_index) {
+    const uint8_t * ptr = (const uint8_t *) data;
+    for (size_t i = 0; i < ggml_spectral_kv_registry_size; ++i) {
+        const struct ggml_spectral_kv_registry_entry * entry = &ggml_spectral_kv_registry[i];
+        if (entry->type != type) {
+            continue;
+        }
+        if (ptr < entry->data || ptr >= entry->data + entry->size) {
+            continue;
+        }
+        const size_t row_size_token = ggml_row_size(type, (int64_t) entry->meta.head_dim_padded * entry->meta.n_head);
+        const size_t row_size_head = ggml_row_size(type, entry->meta.head_dim_padded);
+        const size_t offset = (size_t) (ptr - entry->data);
+        const size_t in_row = offset % row_size_token;
+        GGML_ASSERT(in_row % row_size_head == 0);
+        if (row_index) {
+            *row_index = (uint32_t) (offset / row_size_token);
+        }
+        if (head_index) {
+            *head_index = (uint32_t) (in_row / row_size_head);
+        }
+        return entry;
+    }
+    return NULL;
+}
+
+static struct ggml_spectral_kv_registry_entry * ggml_skv_lookup_registry_mut(
+        void * data,
+        enum ggml_type type,
+        uint32_t * row_index) {
+    uint32_t unused_head = 0;
+    return (struct ggml_spectral_kv_registry_entry *) ggml_skv_lookup_registry(data, type, row_index, &unused_head);
+}
+
+static void ggml_skv_forward_rotate(
+        const struct ggml_spectral_kv_head_meta * meta,
+        const float * input,
+        float * rotated) {
+    for (uint32_t col = 0; col < meta->dim; ++col) {
+        float acc = 0.0f;
+        for (uint32_t row = 0; row < meta->dim; ++row) {
+            acc += meta->basis[(size_t) row * meta->dim + col] * input[row];
+        }
+        rotated[col] = acc;
+    }
+}
+
+static void ggml_skv_inverse_rotate(
+        const struct ggml_spectral_kv_head_meta * meta,
+        const float * rotated,
+        float * output) {
+    for (uint32_t row = 0; row < meta->dim; ++row) {
+        float acc = 0.0f;
+        for (uint32_t col = 0; col < meta->dim; ++col) {
+            acc += meta->basis[(size_t) row * meta->dim + col] * rotated[col];
+        }
+        output[row] = acc;
+    }
+}
+
+static void ggml_skv_quantize_head(
+        enum ggml_type type,
+        const struct ggml_spectral_kv_head_meta * head,
+        uint32_t head_dim_padded,
+        int is_key,
+        int use_correction,
+        const float * src,
+        uint8_t * dst,
+        float * vec_norm_slot,
+        float * residual_norm_slot,
+        uint8_t * sign_slot,
+        uint32_t sign_bytes) {
+    const int bits = ggml_skv_bits(type);
+    const size_t block_size = ggml_type_size(type);
+    float * normalized = (float *) malloc((size_t) head->dim * sizeof(float));
+    float * rotated = (float *) malloc((size_t) head->dim * sizeof(float));
+    float * residual_sem = (float *) malloc((size_t) head->split * sizeof(float));
+    GGML_ASSERT(normalized != NULL && rotated != NULL && residual_sem != NULL);
+
+    float vec_norm = 0.0f;
+    for (uint32_t i = 0; i < head->dim; ++i) {
+        vec_norm += src[i] * src[i];
+    }
+    vec_norm = sqrtf(vec_norm);
+    const float inv_norm = vec_norm > 1e-8f ? 1.0f / vec_norm : 0.0f;
+
+    for (uint32_t i = 0; i < head->dim; ++i) {
+        normalized[i] = src[i] * inv_norm;
+    }
+    ggml_skv_forward_rotate(head, normalized, rotated);
+
+    float residual_ss = 0.0f;
+    for (uint32_t i = 0; i < head->split; ++i) {
+        residual_sem[i] = 0.0f;
+    }
+
+    for (uint32_t block = 0; block < head_dim_padded / QK_SKV; ++block) {
+        uint8_t * block_ptr = dst + block * block_size;
+        uint8_t * qs = ggml_skv_qs_ptr(block_ptr, type);
+        memset(qs, 0, ggml_skv_qs_bytes(type));
+
+        for (uint32_t j = 0; j < QK_SKV; ++j) {
+            const uint32_t idx = block * QK_SKV + j;
+            const int semantic = idx < head->split;
+            const float * codebook = semantic ? head->semantic_codebook : head->tail_codebook;
+            const uint32_t n_levels = semantic ? head->semantic_codebook_size : head->tail_codebook_size;
+            const float value = idx < head->dim ? rotated[idx] : 0.0f;
+            const uint32_t code = ggml_sq_quantize_scalar(value, codebook, n_levels);
+            ggml_sq_pack_index(qs, (int) j, bits, code);
+
+            if (idx < head->dim) {
+                const float residual = value - codebook[code];
+                residual_ss += residual * residual;
+                if (semantic && use_correction && is_key) {
+                    residual_sem[idx] = residual * vec_norm;
+                }
+            }
+        }
+    }
+
+    *vec_norm_slot = vec_norm;
+    if (residual_norm_slot) {
+        *residual_norm_slot = 0.0f;
+    }
+    if (sign_slot && sign_bytes > 0) {
+        memset(sign_slot, 0, sign_bytes);
+    }
+
+    if (is_key && use_correction && residual_norm_slot && sign_slot && sign_bytes > 0) {
+        const float residual_norm = vec_norm * sqrtf(residual_ss);
+        *residual_norm_slot = residual_norm;
+        if (residual_norm > 0.0f) {
+            for (uint32_t proj = 0; proj < head->split; ++proj) {
+                float acc = 0.0f;
+                for (uint32_t i = 0; i < head->split; ++i) {
+                    acc += residual_sem[i] * head->qjl_matrix[(size_t) proj * head->split + i];
+                }
+                ggml_skv_store_sign(sign_slot, proj, acc >= 0.0f);
+            }
+        }
+    }
+
+    free(residual_sem);
+    free(rotated);
+    free(normalized);
+}
+
+static void ggml_skv_quantize_row(
+        enum ggml_type type,
+        const float * x,
+        void * y,
+        int64_t k) {
+    uint32_t row_index = 0;
+    struct ggml_spectral_kv_registry_entry * reg = ggml_skv_lookup_registry_mut(y, type, &row_index);
+    GGML_ASSERT(reg != NULL && "missing spectral KV tensor runtime metadata");
+    GGML_ASSERT(k == (int64_t) reg->meta.head_dim_padded * reg->meta.n_head);
+
+    const size_t row_size_head = ggml_row_size(type, reg->meta.head_dim_padded);
+    for (uint32_t h = 0; h < reg->meta.n_head; ++h) {
+        float * vec_norm_slot = &reg->meta.vec_norms[(size_t) row_index * reg->meta.n_head + h];
+        float * residual_norm_slot = reg->meta.residual_norms ? &reg->meta.residual_norms[(size_t) row_index * reg->meta.n_head + h] : NULL;
+        uint8_t * sign_slot = reg->meta.qjl_signs ? reg->meta.qjl_signs +
+                ((size_t) row_index * reg->meta.n_head + h) * reg->meta.qjl_bytes_per_head : NULL;
+        ggml_skv_quantize_head(
+                type,
+                &reg->meta.heads[h],
+                reg->meta.head_dim_padded,
+                reg->meta.is_key,
+                reg->meta.use_correction,
+                x + (size_t) h * reg->meta.head_dim_padded,
+                (uint8_t *) y + (size_t) h * row_size_head,
+                vec_norm_slot,
+                residual_norm_slot,
+                sign_slot,
+                reg->meta.qjl_bytes_per_head);
+    }
+}
+
+static void ggml_skv_decode_head(
+        enum ggml_type type,
+        const struct ggml_spectral_kv_registry_entry * reg,
+        uint32_t row_index,
+        uint32_t head_index,
+        const uint8_t * src,
+        float * dst) {
+    const struct ggml_spectral_kv_head_meta * head = &reg->meta.heads[head_index];
+    const int bits = ggml_skv_bits(type);
+    float * rotated = (float *) malloc((size_t) head->dim * sizeof(float));
+    float * decoded = (float *) malloc((size_t) head->dim * sizeof(float));
+    GGML_ASSERT(rotated != NULL && decoded != NULL);
+
+    for (uint32_t i = 0; i < head->dim; ++i) {
+        rotated[i] = 0.0f;
+    }
+
+    for (uint32_t block = 0; block < reg->meta.head_dim_padded / QK_SKV; ++block) {
+        const uint8_t * block_ptr = src + block * ggml_type_size(type);
+        const uint8_t * qs = ggml_skv_qs_ptr_const(block_ptr, type);
+
+        for (uint32_t j = 0; j < QK_SKV; ++j) {
+            const uint32_t idx = block * QK_SKV + j;
+            if (idx >= head->dim) {
+                continue;
+            }
+            const int semantic = idx < head->split;
+            const float * codebook = semantic ? head->semantic_codebook : head->tail_codebook;
+            const uint32_t n_levels = semantic ? head->semantic_codebook_size : head->tail_codebook_size;
+            uint32_t code = ggml_sq_unpack_index(qs, (int) j, bits);
+            if (code >= n_levels) {
+                code = n_levels - 1;
+            }
+            rotated[idx] = codebook[code] * reg->meta.vec_norms[(size_t) row_index * reg->meta.n_head + head_index];
+        }
+    }
+
+    ggml_skv_inverse_rotate(head, rotated, decoded);
+    memcpy(dst, decoded, (size_t) head->dim * sizeof(float));
+    if (reg->meta.head_dim_padded > head->dim) {
+        memset(dst + head->dim, 0, (size_t) (reg->meta.head_dim_padded - head->dim) * sizeof(float));
+    }
+
+    free(decoded);
+    free(rotated);
+}
+
+static void ggml_skv_dequantize(
+        enum ggml_type type,
+        const void * x,
+        float * y,
+        int64_t k) {
+    uint32_t row_index = 0;
+    uint32_t head_index = 0;
+    const struct ggml_spectral_kv_registry_entry * reg = ggml_skv_lookup_registry(x, type, &row_index, &head_index);
+    GGML_ASSERT(reg != NULL && "missing spectral KV tensor runtime metadata");
+
+    if (k == reg->meta.head_dim_padded) {
+        ggml_skv_decode_head(type, reg, row_index, head_index, (const uint8_t *) x, y);
+        return;
+    }
+
+    if (k == (int64_t) reg->meta.head_dim_padded * reg->meta.n_head && head_index == 0) {
+        const size_t row_size_head = ggml_row_size(type, reg->meta.head_dim_padded);
+        for (uint32_t h = 0; h < reg->meta.n_head; ++h) {
+            ggml_skv_decode_head(type, reg, row_index, h, (const uint8_t *) x + (size_t) h * row_size_head,
+                    y + (size_t) h * reg->meta.head_dim_padded);
+        }
+        return;
+    }
+
+    GGML_ABORT("%s: unsupported SKV dequantize width %" PRId64, __func__, k);
+}
+
+static void ggml_skv_vec_dot_f32(
+        enum ggml_type type,
+        int n,
+        float * GGML_RESTRICT s,
+        const void * GGML_RESTRICT vx,
+        const void * GGML_RESTRICT vy) {
+    uint32_t row_index = 0;
+    uint32_t head_index = 0;
+    const struct ggml_spectral_kv_registry_entry * reg = ggml_skv_lookup_registry(vx, type, &row_index, &head_index);
+    GGML_ASSERT(reg != NULL && "missing spectral KV tensor runtime metadata");
+    GGML_ASSERT(n == (int) reg->meta.head_dim_padded);
+
+    const struct ggml_spectral_kv_head_meta * head = &reg->meta.heads[head_index];
+    const int bits = ggml_skv_bits(type);
+    const float * query = (const float *) vy;
+    const uint8_t * row_ptr = (const uint8_t *) vx;
+    const float vec_norm = reg->meta.vec_norms[(size_t) row_index * reg->meta.n_head + head_index];
+
+    float * q_rot = (float *) malloc((size_t) head->dim * sizeof(float));
+    GGML_ASSERT(q_rot != NULL);
+    ggml_skv_forward_rotate(head, query, q_rot);
+
+    float term1 = 0.0f;
+    for (uint32_t block = 0; block < reg->meta.head_dim_padded / QK_SKV; ++block) {
+        const uint8_t * block_ptr = row_ptr + block * ggml_type_size(type);
+        const uint8_t * qs = ggml_skv_qs_ptr_const(block_ptr, type);
+
+        for (uint32_t j = 0; j < QK_SKV; ++j) {
+            const uint32_t idx = block * QK_SKV + j;
+            if (idx >= head->dim) {
+                continue;
+            }
+            const int semantic = idx < head->split;
+            const float * codebook = semantic ? head->semantic_codebook : head->tail_codebook;
+            const uint32_t n_levels = semantic ? head->semantic_codebook_size : head->tail_codebook_size;
+            uint32_t code = ggml_sq_unpack_index(qs, (int) j, bits);
+            if (code >= n_levels) {
+                code = n_levels - 1;
+            }
+            term1 += q_rot[idx] * (codebook[code] * vec_norm);
+        }
+    }
+
+    float term2 = 0.0f;
+    if (reg->meta.is_key && reg->meta.use_correction && reg->meta.residual_norms && reg->meta.qjl_signs && head->split > 0) {
+        const float residual_norm = reg->meta.residual_norms[(size_t) row_index * reg->meta.n_head + head_index];
+        if (residual_norm > 0.0f) {
+            const uint8_t * sign_slot = reg->meta.qjl_signs +
+                    ((size_t) row_index * reg->meta.n_head + head_index) * reg->meta.qjl_bytes_per_head;
+            for (uint32_t proj = 0; proj < head->split; ++proj) {
+                float acc = 0.0f;
+                for (uint32_t i = 0; i < head->split; ++i) {
+                    acc += q_rot[i] * head->qjl_matrix[(size_t) proj * head->split + i];
+                }
+                term2 += acc * (float) ggml_skv_load_sign(sign_slot, proj);
+            }
+            term2 *= TURBO_QJL_CONST * residual_norm / (float) head->split;
+        }
+    }
+
+    *s = term1 + term2;
+    free(q_rot);
+}
+
+void quantize_row_skv2_0_ref(const float * GGML_RESTRICT x, block_skv2_0 * GGML_RESTRICT y, int64_t k) {
+    ggml_skv_quantize_row(GGML_TYPE_SKV2_0, x, y, k);
+}
+
+void quantize_row_skv3_0_ref(const float * GGML_RESTRICT x, block_skv3_0 * GGML_RESTRICT y, int64_t k) {
+    ggml_skv_quantize_row(GGML_TYPE_SKV3_0, x, y, k);
+}
+
+void quantize_row_skv4_0_ref(const float * GGML_RESTRICT x, block_skv4_0 * GGML_RESTRICT y, int64_t k) {
+    ggml_skv_quantize_row(GGML_TYPE_SKV4_0, x, y, k);
+}
+
+void dequantize_row_skv2_0(const block_skv2_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    ggml_skv_dequantize(GGML_TYPE_SKV2_0, x, y, k);
+}
+
+void dequantize_row_skv3_0(const block_skv3_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    ggml_skv_dequantize(GGML_TYPE_SKV3_0, x, y, k);
+}
+
+void dequantize_row_skv4_0(const block_skv4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    ggml_skv_dequantize(GGML_TYPE_SKV4_0, x, y, k);
+}
+
+void ggml_vec_dot_skv2_0_f32(int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, size_t bx,
+        const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    GGML_ASSERT(nrc == 1);
+    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);
+    ggml_skv_vec_dot_f32(GGML_TYPE_SKV2_0, n, s, vx, vy);
+}
+
+void ggml_vec_dot_skv3_0_f32(int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, size_t bx,
+        const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    GGML_ASSERT(nrc == 1);
+    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);
+    ggml_skv_vec_dot_f32(GGML_TYPE_SKV3_0, n, s, vx, vy);
+}
+
+void ggml_vec_dot_skv4_0_f32(int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, size_t bx,
+        const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    GGML_ASSERT(nrc == 1);
+    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);
+    ggml_skv_vec_dot_f32(GGML_TYPE_SKV4_0, n, s, vx, vy);
+}
+
+bool ggml_spectral_kv_register_tensor(
+        const void * owner,
+        void * data,
+        size_t size,
+        enum ggml_type type,
+        const struct ggml_spectral_kv_meta * meta) {
+    if (!ggml_skv_meta_valid(meta, type) || data == NULL || size == 0) {
+        return false;
+    }
+
+    for (size_t i = 0; i < ggml_spectral_kv_registry_size; ++i) {
+        if (ggml_spectral_kv_registry[i].data == (uint8_t *) data) {
+            ggml_spectral_kv_registry[i].owner = owner;
+            ggml_spectral_kv_registry[i].size = size;
+            ggml_spectral_kv_registry[i].type = type;
+            ggml_spectral_kv_registry[i].meta = *meta;
+            return true;
+        }
+    }
+
+    if (ggml_spectral_kv_registry_size == ggml_spectral_kv_registry_capacity) {
+        const size_t new_capacity = ggml_spectral_kv_registry_capacity == 0 ? 16 : ggml_spectral_kv_registry_capacity * 2;
+        struct ggml_spectral_kv_registry_entry * new_entries = (struct ggml_spectral_kv_registry_entry *) realloc(
+                ggml_spectral_kv_registry, new_capacity * sizeof(struct ggml_spectral_kv_registry_entry));
+        if (new_entries == NULL) {
+            return false;
+        }
+        ggml_spectral_kv_registry = new_entries;
+        ggml_spectral_kv_registry_capacity = new_capacity;
+    }
+
+    ggml_spectral_kv_registry[ggml_spectral_kv_registry_size++] = (struct ggml_spectral_kv_registry_entry) {
+        .owner = owner,
+        .data = (uint8_t *) data,
+        .size = size,
+        .type = type,
+        .meta = *meta,
+    };
+    return true;
+}
+
+void ggml_spectral_kv_unregister_owner(const void * owner) {
+    if (owner == NULL || ggml_spectral_kv_registry_size == 0) {
+        return;
+    }
+
+    size_t dst = 0;
+    for (size_t src = 0; src < ggml_spectral_kv_registry_size; ++src) {
+        if (ggml_spectral_kv_registry[src].owner != owner) {
+            if (dst != src) {
+                ggml_spectral_kv_registry[dst] = ggml_spectral_kv_registry[src];
+            }
+            ++dst;
+        }
+    }
+    ggml_spectral_kv_registry_size = dst;
 }

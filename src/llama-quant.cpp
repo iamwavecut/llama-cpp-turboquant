@@ -1,4 +1,5 @@
 #include "llama-impl.h"
+#include "llama-spectral.h"
 #include "llama-model.h"
 #include "llama-model-loader.h"
 #include "llama-ext.h"
@@ -156,6 +157,58 @@ static bool category_is_attn_v(tensor_category cat) {
            cat == tensor_category::ATTENTION_KV_B;
 }
 
+static bool llama_ftype_is_sq_family(llama_ftype ftype) {
+    return ftype == LLAMA_FTYPE_MOSTLY_SQ2_0 ||
+           ftype == LLAMA_FTYPE_MOSTLY_SQ3_1S ||
+           ftype == LLAMA_FTYPE_MOSTLY_SQ4_1S;
+}
+
+static bool llama_type_is_sq_weight(ggml_type type) {
+    return type == GGML_TYPE_SQ2_0 ||
+           type == GGML_TYPE_SQ3_1S ||
+           type == GGML_TYPE_SQ4_1S;
+}
+
+static bool spectral_profile_is_explicit(const char * profile_text) {
+    return profile_text != nullptr &&
+           profile_text[0] != '\0' &&
+           std::strcmp(profile_text, "all") != 0 &&
+           std::strcmp(profile_text, "auto") != 0;
+}
+
+static const llama_spectral_entry * find_spectral_weight_entry(
+        const llama_spectral_artifact * artifact,
+        const char * name,
+        const char * requested_profile) {
+    if (artifact == nullptr || name == nullptr) {
+        return nullptr;
+    }
+
+    if (spectral_profile_is_explicit(requested_profile)) {
+        llama_spectral_profile profile;
+        if (llama_spectral_profile_parse(requested_profile, profile)) {
+            for (const auto & entry : artifact->entries) {
+                if (entry.name == name && entry.profile == profile) {
+                    return &entry;
+                }
+            }
+        }
+    }
+
+    for (const auto & entry : artifact->entries) {
+        if (entry.name == name && entry.profile == LLAMA_SPECTRAL_PROFILE_ROTATION_NONUNIFORM_SELCORR) {
+            return &entry;
+        }
+    }
+    for (const auto & entry : artifact->entries) {
+        if (entry.name == name && entry.profile == LLAMA_SPECTRAL_PROFILE_ROTATION_NONUNIFORM) {
+            return &entry;
+        }
+    }
+
+    return nullptr;
+}
+
 //
 // quantization state
 //
@@ -245,11 +298,15 @@ static void llama_tensor_dequantize_impl(
     if (tensor->type == GGML_TYPE_F16 ||
         tensor->type == GGML_TYPE_BF16) {
         block_size = 1;
+    } else if (ggml_is_spectral_weight_type(tensor->type)) {
+        block_size = (size_t) tensor->ne[0];
     } else {
         block_size = (size_t)ggml_blck_size(tensor->type);
     }
 
-    size_t block_size_bytes = ggml_type_size(tensor->type);
+    size_t block_size_bytes = ggml_is_spectral_weight_type(tensor->type)
+            ? ggml_row_size(tensor->type, tensor->ne[0])
+            : ggml_type_size(tensor->type);
 
     GGML_ASSERT(nelements % block_size == 0);
     size_t nblocks = nelements / block_size;
@@ -383,7 +440,10 @@ static ggml_type tensor_type_fallback(quantize_state_impl & qs, const ggml_tenso
             case GGML_TYPE_Q2_K:
             case GGML_TYPE_Q3_K:
             case GGML_TYPE_TQ1_0:
-            case GGML_TYPE_TQ2_0:   return_type = GGML_TYPE_Q4_0;   break;
+            case GGML_TYPE_TQ2_0:
+            case GGML_TYPE_SQ2_0:
+            case GGML_TYPE_SQ3_1S:
+            case GGML_TYPE_SQ4_1S:  return_type = GGML_TYPE_Q4_0;   break;
             case GGML_TYPE_Q4_K:    return_type = GGML_TYPE_Q5_0;   break;
             case GGML_TYPE_Q5_K:    return_type = GGML_TYPE_Q5_1;   break;
             case GGML_TYPE_Q6_K:    return_type = GGML_TYPE_Q8_0;   break;
@@ -413,6 +473,10 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
 
     // TODO: avoid hardcoded tensor names - use the TN_* constants
     const llm_arch arch = qs.model.arch;
+
+    if (llama_ftype_is_sq_family(ftype)) {
+        return new_type;
+    }
 
     auto use_more_bits = [](int i_layer, int n_layers) -> bool {
         return i_layer < n_layers/8 || i_layer >= 7*n_layers/8 || (i_layer - n_layers/8)%3 == 2;
@@ -760,6 +824,115 @@ static size_t llama_tensor_quantize_impl(enum ggml_type new_type, const float * 
     return new_size;
 }
 
+static size_t llama_tensor_quantize_spectral_impl(
+        enum ggml_type new_type,
+        const llama_spectral_entry & spectral_entry,
+        const float * f32_data,
+        void * new_data,
+        const int64_t chunk_size,
+        int64_t nrows,
+        int64_t n_per_row,
+        std::vector<std::thread> & workers,
+        const int nthread) {
+    std::string spectral_err;
+    llama_spectral_entry prepared;
+    if (!llama_spectral_prepare_weight_entry(spectral_entry, new_type, prepared, &spectral_err)) {
+        throw std::runtime_error(format("failed to prepare spectral entry for %s: %s",
+                spectral_entry.name.c_str(), spectral_err.c_str()));
+    }
+
+    const ggml_spectral_weight_meta meta = {
+        /*.dim                    =*/ prepared.dim,
+        /*.split                  =*/ prepared.split,
+        /*.correction_dim         =*/ prepared.correction_dim,
+        /*.semantic_codebook_size =*/ (uint32_t) prepared.semantic_codebook.size(),
+        /*.tail_codebook_size     =*/ (uint32_t) prepared.tail_codebook.size(),
+        /*.basis                  =*/ prepared.basis.data(),
+        /*.semantic_codebook      =*/ prepared.semantic_codebook.data(),
+        /*.tail_codebook          =*/ prepared.tail_codebook.data(),
+    };
+
+    const auto quantize_range = [&](int64_t first_row, int64_t this_nrow, std::string * err) -> size_t {
+        const size_t row_size = ggml_row_size(new_type, n_per_row);
+        const size_t this_size = ggml_quantize_spectral_weight(
+                new_type,
+                f32_data + first_row * n_per_row,
+                (char *) new_data + first_row * row_size,
+                this_nrow,
+                n_per_row,
+                &meta);
+        if (this_size == 0) {
+            if (err) {
+                *err = format("spectral quantization failed for tensor %s", spectral_entry.name.c_str());
+            }
+            return 0;
+        }
+        if (!ggml_validate_row_data(new_type, (char *) new_data + first_row * row_size, this_size)) {
+            if (err) {
+                *err = "spectral quantized data validation failed";
+            }
+            return 0;
+        }
+        return this_size;
+    };
+
+    if (nthread < 2) {
+        std::string err;
+        const size_t new_size = quantize_range(0, nrows, &err);
+        if (!err.empty()) {
+            throw std::runtime_error(err);
+        }
+        return new_size;
+    }
+
+    std::mutex mutex;
+    int64_t counter = 0;
+    size_t new_size = 0;
+    bool valid = true;
+    std::string error_message;
+    const int64_t nrows_per_chunk = std::max<int64_t>(1, chunk_size / n_per_row);
+    auto compute = [&]() {
+        size_t local_size = 0;
+        while (true) {
+            std::unique_lock<std::mutex> lock(mutex);
+            const int64_t first_row = counter;
+            counter += nrows_per_chunk;
+            if (first_row >= nrows) {
+                new_size += local_size;
+                break;
+            }
+            lock.unlock();
+
+            const int64_t this_nrow = std::min(nrows - first_row, nrows_per_chunk);
+            std::string local_err;
+            const size_t this_size = quantize_range(first_row, this_nrow, &local_err);
+            if (!local_err.empty()) {
+                std::unique_lock<std::mutex> fail_lock(mutex);
+                valid = false;
+                if (error_message.empty()) {
+                    error_message = std::move(local_err);
+                }
+                break;
+            }
+            local_size += this_size;
+        }
+    };
+
+    for (int it = 0; it < nthread - 1; ++it) {
+        workers.emplace_back(compute);
+    }
+    compute();
+    for (auto & w : workers) {
+        w.join();
+    }
+    workers.clear();
+
+    if (!valid) {
+        throw std::runtime_error(error_message);
+    }
+    return new_size;
+}
+
 //
 // imatrix requirement check
 //
@@ -818,6 +991,9 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_TQ2_0:   return GGML_TYPE_TQ2_0;
         case LLAMA_FTYPE_MOSTLY_TQ3_1S:  return GGML_TYPE_TQ3_1S;
         case LLAMA_FTYPE_MOSTLY_TQ4_1S:  return GGML_TYPE_TQ4_1S;
+        case LLAMA_FTYPE_MOSTLY_SQ2_0:   return GGML_TYPE_SQ2_0;
+        case LLAMA_FTYPE_MOSTLY_SQ3_1S:  return GGML_TYPE_SQ3_1S;
+        case LLAMA_FTYPE_MOSTLY_SQ4_1S:  return GGML_TYPE_SQ4_1S;
         case LLAMA_FTYPE_MOSTLY_IQ2_XXS: return GGML_TYPE_IQ2_XXS;
         case LLAMA_FTYPE_MOSTLY_IQ2_XS:  return GGML_TYPE_IQ2_XS;
         case LLAMA_FTYPE_MOSTLY_IQ2_S:   return GGML_TYPE_IQ2_XS;
@@ -891,6 +1067,10 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
     quantize_state_impl qs(model, params);
 
+    static const char * const LLM_KV_QUANTIZE_SPECTRAL_FILE      = "quantize.spectral.file";
+    static const char * const LLM_KV_QUANTIZE_SPECTRAL_PROFILE   = "quantize.spectral.profile";
+    static const char * const LLM_KV_QUANTIZE_SPECTRAL_N_ENTRIES = "quantize.spectral.entries_count";
+
     if (params->only_copy) {
         ftype = ml.ftype;
     }
@@ -918,6 +1098,10 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
     const size_t align = GGUF_DEFAULT_ALIGNMENT;
     gguf_context_ptr ctx_out { gguf_init_empty() };
+    llama_spectral_artifact spectral_weight_artifact;
+    bool have_spectral_weight_artifact = false;
+    std::string spectral_profile_filter =
+            params->spectral_profile && params->spectral_profile[0] ? params->spectral_profile : "all";
 
     std::vector<int> prune_list = {};
     if (params->prune_layers) {
@@ -930,6 +1114,65 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     gguf_set_kv     (ctx_out.get(), ml.metadata);
     gguf_set_val_u32(ctx_out.get(), "general.quantization_version", GGML_QNT_VERSION); // TODO: use LLM_KV
     gguf_set_val_u32(ctx_out.get(), "general.file_type", ftype); // TODO: use LLM_KV
+
+    if (params->spectral_calibration != nullptr && params->spectral_calibration[0] != '\0') {
+        llama_spectral_artifact spectral_artifact;
+        std::string spectral_err;
+        if (!llama_spectral_load_gguf(params->spectral_calibration, spectral_artifact, &spectral_err)) {
+            throw std::runtime_error(format("failed to load spectral calibration '%s': %s", params->spectral_calibration, spectral_err.c_str()));
+        }
+
+        if (!spectral_artifact.source_architecture.empty() && spectral_artifact.source_architecture != model.arch_name()) {
+            throw std::runtime_error(format("spectral calibration architecture mismatch: artifact=%s model=%s",
+                    spectral_artifact.source_architecture.c_str(), model.arch_name().c_str()));
+        }
+        if (!spectral_artifact.source_digest.empty()) {
+            std::vector<const ggml_tensor *> model_tensors;
+            model_tensors.reserve(ml.weights_map.size());
+            for (const auto & [_, weight] : ml.weights_map) {
+                model_tensors.push_back(weight.tensor);
+            }
+
+            const std::string model_digest = llama_spectral_compute_tensor_digest(model.arch_name().c_str(), model_tensors);
+            if (model_digest != spectral_artifact.source_digest) {
+                throw std::runtime_error(format("spectral calibration digest mismatch: artifact=%s model=%s",
+                        spectral_artifact.source_digest.c_str(), model_digest.c_str()));
+            }
+        }
+
+        llama_spectral_artifact filtered;
+        if (!llama_spectral_filter_artifact(
+                    spectral_artifact,
+                    LLAMA_SPECTRAL_KIND_WEIGHT,
+                    spectral_profile_filter.c_str(),
+                    filtered,
+                    &spectral_err)) {
+            throw std::runtime_error(format("failed to filter spectral metadata: %s", spectral_err.c_str()));
+        }
+
+        if (filtered.entries.empty()) {
+            throw std::runtime_error("spectral calibration does not contain any matching weight entries");
+        }
+
+        spectral_weight_artifact = std::move(filtered);
+        have_spectral_weight_artifact = true;
+        gguf_set_val_str(ctx_out.get(), LLM_KV_QUANTIZE_SPECTRAL_FILE, params->spectral_calibration);
+        gguf_set_val_str(ctx_out.get(), LLM_KV_QUANTIZE_SPECTRAL_PROFILE,
+                spectral_profile_filter.c_str());
+        gguf_set_val_u32(ctx_out.get(), LLM_KV_QUANTIZE_SPECTRAL_N_ENTRIES, spectral_weight_artifact.entries.size());
+    } else if (const auto * embedded = model.spectral_weights()) {
+        spectral_weight_artifact = *embedded;
+        have_spectral_weight_artifact = !spectral_weight_artifact.entries.empty();
+        if (have_spectral_weight_artifact && !spectral_profile_is_explicit(spectral_profile_filter.c_str())) {
+            const auto it = model.gguf_kv.find(LLM_KV_QUANTIZE_SPECTRAL_PROFILE);
+            if (it != model.gguf_kv.end() && spectral_profile_is_explicit(it->second.c_str())) {
+                spectral_profile_filter = it->second;
+            }
+        }
+        if (have_spectral_weight_artifact && spectral_profile_is_explicit(spectral_profile_filter.c_str())) {
+            gguf_set_val_str(ctx_out.get(), LLM_KV_QUANTIZE_SPECTRAL_PROFILE, spectral_profile_filter.c_str());
+        }
+    }
 
     // Remove split metadata
     gguf_remove_key(ctx_out.get(), ml.llm_kv(LLM_KV_SPLIT_NO).c_str());
@@ -1215,6 +1458,22 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                     f32_data = (float *) f32_conv_buf.data();
                 }
 
+                const llama_spectral_entry * spectral_entry = nullptr;
+                if (llama_type_is_sq_weight(new_type)) {
+                    if (!have_spectral_weight_artifact) {
+                        throw std::runtime_error(format("spectral quantization for %s requires spectral calibration metadata",
+                                tensor->name));
+                    }
+                    spectral_entry = find_spectral_weight_entry(&spectral_weight_artifact, tensor->name, spectral_profile_filter.c_str());
+                    if (spectral_entry == nullptr) {
+                        throw std::runtime_error(format("no spectral profile found for SQ tensor %s", tensor->name));
+                    }
+                    if (spectral_entry->dim != tensor->ne[0]) {
+                        throw std::runtime_error(format("spectral entry dimension mismatch for %s: spectral=%u tensor=%lld",
+                                tensor->name, spectral_entry->dim, (long long) tensor->ne[0]));
+                    }
+                }
+
                 LLAMA_LOG_INFO("converting to %s .. ", ggml_type_name(new_type));
                 fflush(stdout);
 
@@ -1240,7 +1499,12 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                     void * new_data_03 = (char *)new_data + ggml_row_size(new_type, n_per_row) * i03 * nrows;
                     const float * imatrix_03 = imatrix ? imatrix + i03 * n_per_row : nullptr;
 
-                    new_size += llama_tensor_quantize_impl(new_type, f32_data_03, new_data_03, chunk_size, nrows, n_per_row, imatrix_03, workers, nthread_use);
+                    if (llama_type_is_sq_weight(new_type)) {
+                        GGML_UNUSED(imatrix_03);
+                        new_size += llama_tensor_quantize_spectral_impl(new_type, *spectral_entry, f32_data_03, new_data_03, chunk_size, nrows, n_per_row, workers, nthread_use);
+                    } else {
+                        new_size += llama_tensor_quantize_impl(new_type, f32_data_03, new_data_03, chunk_size, nrows, n_per_row, imatrix_03, workers, nthread_use);
+                    }
                 }
                 LLAMA_LOG_INFO("size = %8.2f MiB -> %8.2f MiB\n", tensor_size/1024.0/1024.0, new_size/1024.0/1024.0);
             }
@@ -1296,7 +1560,9 @@ llama_model_quantize_params llama_model_quantize_default_params() {
         /*.imatrix                     =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
         /*.tensor_type                 =*/ nullptr,
-        /*.prune_layers                =*/ nullptr
+        /*.prune_layers                =*/ nullptr,
+        /*.spectral_calibration        =*/ nullptr,
+        /*.spectral_profile            =*/ nullptr
     };
 
     return result;

@@ -78,6 +78,10 @@ static bool vec_vec_tensor_buft_override_equal(const std::vector<std::vector<lla
     return true;
 }
 
+static bool spectral_profile_valid(const std::string & profile) {
+    return profile.empty() || profile == "auto" || profile == "all" || profile == "nonuniform" || profile == "selcorr";
+}
+
 template <class T> static std::string join(const std::vector<T> & values, const std::string & delim) {
     std::ostringstream str;
     for (size_t i = 0; i < values.size(); i++) {
@@ -324,6 +328,10 @@ struct cmd_params {
     std::vector<int>                 n_ubatch;
     std::vector<ggml_type>           type_k;
     std::vector<ggml_type>           type_v;
+    std::vector<std::string>         spectral_weight_calibration;
+    std::vector<std::string>         spectral_kv_calibration;
+    std::vector<std::string>         spectral_weight_profile;
+    std::vector<std::string>         spectral_kv_profile;
     std::vector<int>                 n_threads;
     std::vector<std::string>         cpu_mask;
     std::vector<bool>                cpu_strict;
@@ -366,6 +374,10 @@ static const cmd_params cmd_params_defaults = {
     /* n_ubatch             */ { 512 },
     /* type_k               */ { GGML_TYPE_F16 },
     /* type_v               */ { GGML_TYPE_F16 },
+    /* spectral_weight_calibration */ { "" },
+    /* spectral_kv_calibration     */ { "" },
+    /* spectral_weight_profile     */ { "auto" },
+    /* spectral_kv_profile         */ { "auto" },
     /* n_threads            */ { cpu_get_num_math() },
     /* cpu_mask             */ { "0x0" },
     /* cpu_strict           */ { false },
@@ -432,6 +444,18 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -ub, --ubatch-size <n>                      (default: %s)\n", join(cmd_params_defaults.n_ubatch, ",").c_str());
     printf("  -ctk, --cache-type-k <t>                    (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_k, ggml_type_name), ",").c_str());
     printf("  -ctv, --cache-type-v <t>                    (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_v, ggml_type_name), ",").c_str());
+    printf("  --spectral-calibration <path>               spectral calibration GGUF sidecar for both SQ and SKV runtime\n");
+    printf("                                              (default: disabled)\n");
+    printf("  --spectral-weight-calibration <path>        spectral calibration GGUF sidecar for SQ runtime only\n");
+    printf("                                              (default: disabled)\n");
+    printf("  --spectral-kv-calibration <path>            spectral calibration GGUF sidecar for SKV runtime only\n");
+    printf("                                              (default: disabled)\n");
+    printf("  --spectral-profile <auto|all|nonuniform|selcorr>\n");
+    printf("                                              spectral profile filter for both SQ and SKV runtime (default: %s)\n", join(cmd_params_defaults.spectral_weight_profile, ",").c_str());
+    printf("  --spectral-weight-profile <auto|all|nonuniform|selcorr>\n");
+    printf("                                              spectral profile filter for SQ runtime only (default: %s)\n", join(cmd_params_defaults.spectral_weight_profile, ",").c_str());
+    printf("  --spectral-kv-profile <auto|all|nonuniform|selcorr>\n");
+    printf("                                              spectral profile filter for SKV runtime only (default: %s)\n", join(cmd_params_defaults.spectral_kv_profile, ",").c_str());
     printf("  -t, --threads <n>                           (default: %s)\n", join(cmd_params_defaults.n_threads, ",").c_str());
     printf("  -C, --cpu-mask <hex,hex>                    (default: %s)\n", join(cmd_params_defaults.cpu_mask, ",").c_str());
     printf("  --cpu-strict <0|1>                          (default: %s)\n", join(cmd_params_defaults.cpu_strict, ",").c_str());
@@ -491,6 +515,15 @@ static ggml_type ggml_type_from_name(const std::string & s) {
     }
     if (s == "turbo4") {
         return GGML_TYPE_TURBO4_0;
+    }
+    if (s == "skv2" || s == "skv2_0") {
+        return GGML_TYPE_SKV2_0;
+    }
+    if (s == "skv3" || s == "skv3_0") {
+        return GGML_TYPE_SKV3_0;
+    }
+    if (s == "skv4" || s == "skv4_0") {
+        return GGML_TYPE_SKV4_0;
     }
 
     return GGML_TYPE_COUNT;
@@ -640,6 +673,77 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     break;
                 }
                 params.type_v.insert(params.type_v.end(), types.begin(), types.end());
+            } else if (arg == "--spectral-calibration") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<std::string>(argv[i], split_delim);
+                params.spectral_weight_calibration.insert(params.spectral_weight_calibration.end(), p.begin(), p.end());
+                params.spectral_kv_calibration.insert(params.spectral_kv_calibration.end(), p.begin(), p.end());
+            } else if (arg == "--spectral-weight-calibration") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<std::string>(argv[i], split_delim);
+                params.spectral_weight_calibration.insert(params.spectral_weight_calibration.end(), p.begin(), p.end());
+            } else if (arg == "--spectral-kv-calibration") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<std::string>(argv[i], split_delim);
+                params.spectral_kv_calibration.insert(params.spectral_kv_calibration.end(), p.begin(), p.end());
+            } else if (arg == "--spectral-profile") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<std::string>(argv[i], split_delim);
+                for (const auto & profile : p) {
+                    if (!spectral_profile_valid(profile)) {
+                        invalid_param = true;
+                        break;
+                    }
+                }
+                if (invalid_param) {
+                    break;
+                }
+                params.spectral_weight_profile.insert(params.spectral_weight_profile.end(), p.begin(), p.end());
+                params.spectral_kv_profile.insert(params.spectral_kv_profile.end(), p.begin(), p.end());
+            } else if (arg == "--spectral-weight-profile") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<std::string>(argv[i], split_delim);
+                for (const auto & profile : p) {
+                    if (!spectral_profile_valid(profile)) {
+                        invalid_param = true;
+                        break;
+                    }
+                }
+                if (invalid_param) {
+                    break;
+                }
+                params.spectral_weight_profile.insert(params.spectral_weight_profile.end(), p.begin(), p.end());
+            } else if (arg == "--spectral-kv-profile") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<std::string>(argv[i], split_delim);
+                for (const auto & profile : p) {
+                    if (!spectral_profile_valid(profile)) {
+                        invalid_param = true;
+                        break;
+                    }
+                }
+                if (invalid_param) {
+                    break;
+                }
+                params.spectral_kv_profile.insert(params.spectral_kv_profile.end(), p.begin(), p.end());
             } else if (arg == "-dev" || arg == "--device") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1033,6 +1137,18 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.type_v.empty()) {
         params.type_v = cmd_params_defaults.type_v;
     }
+    if (params.spectral_weight_calibration.empty()) {
+        params.spectral_weight_calibration = cmd_params_defaults.spectral_weight_calibration;
+    }
+    if (params.spectral_kv_calibration.empty()) {
+        params.spectral_kv_calibration = cmd_params_defaults.spectral_kv_calibration;
+    }
+    if (params.spectral_weight_profile.empty()) {
+        params.spectral_weight_profile = cmd_params_defaults.spectral_weight_profile;
+    }
+    if (params.spectral_kv_profile.empty()) {
+        params.spectral_kv_profile = cmd_params_defaults.spectral_kv_profile;
+    }
     if (params.n_gpu_layers.empty()) {
         params.n_gpu_layers = cmd_params_defaults.n_gpu_layers;
     }
@@ -1100,6 +1216,10 @@ struct cmd_params_instance {
     int                n_ubatch;
     ggml_type          type_k;
     ggml_type          type_v;
+    std::string        spectral_weight_calibration;
+    std::string        spectral_kv_calibration;
+    std::string        spectral_weight_profile;
+    std::string        spectral_kv_profile;
     int                n_threads;
     std::string        cpu_mask;
     bool               cpu_strict;
@@ -1129,6 +1249,8 @@ struct cmd_params_instance {
         mparams.split_mode    = split_mode;
         mparams.main_gpu      = main_gpu;
         mparams.tensor_split  = tensor_split.data();
+        mparams.spectral_calibration = spectral_weight_calibration.empty() ? nullptr : spectral_weight_calibration.c_str();
+        mparams.spectral_profile     = spectral_weight_profile.empty() ? nullptr : spectral_weight_profile.c_str();
         mparams.use_mmap      = use_mmap;
         mparams.use_direct_io = use_direct_io;
         mparams.no_host       = no_host;
@@ -1176,6 +1298,8 @@ struct cmd_params_instance {
         return model == other.model && n_gpu_layers == other.n_gpu_layers && n_cpu_moe == other.n_cpu_moe &&
                split_mode == other.split_mode &&
                main_gpu == other.main_gpu && tensor_split == other.tensor_split &&
+               spectral_weight_calibration == other.spectral_weight_calibration &&
+               spectral_weight_profile == other.spectral_weight_profile &&
                use_mmap == other.use_mmap && use_direct_io == other.use_direct_io &&
                devices == other.devices &&
                no_host == other.no_host &&
@@ -1190,6 +1314,8 @@ struct cmd_params_instance {
         cparams.n_ubatch        = n_ubatch;
         cparams.type_k          = type_k;
         cparams.type_v          = type_v;
+        cparams.spectral_calibration = spectral_kv_calibration.empty() ? nullptr : spectral_kv_calibration.c_str();
+        cparams.spectral_profile     = spectral_kv_profile.empty() ? nullptr : spectral_kv_profile.c_str();
         cparams.offload_kqv     = !no_kv_offload;
         cparams.flash_attn_type = flash_attn ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
         cparams.embeddings      = embeddings;
@@ -1199,6 +1325,36 @@ struct cmd_params_instance {
         return cparams;
     }
 };
+
+static std::string spectral_calibration_display(
+        const std::string & spectral_weight_calibration,
+        const std::string & spectral_kv_calibration) {
+    if (spectral_weight_calibration == spectral_kv_calibration) {
+        return spectral_weight_calibration;
+    }
+    if (spectral_weight_calibration.empty()) {
+        return "kv:" + spectral_kv_calibration;
+    }
+    if (spectral_kv_calibration.empty()) {
+        return "weight:" + spectral_weight_calibration;
+    }
+    return "weight:" + spectral_weight_calibration + ";kv:" + spectral_kv_calibration;
+}
+
+static std::string spectral_profile_display(
+        const std::string & spectral_weight_profile,
+        const std::string & spectral_kv_profile) {
+    if (spectral_weight_profile == spectral_kv_profile) {
+        return spectral_weight_profile;
+    }
+    if (spectral_weight_profile.empty()) {
+        return "kv:" + spectral_kv_profile;
+    }
+    if (spectral_kv_profile.empty()) {
+        return "weight:" + spectral_weight_profile;
+    }
+    return "weight:" + spectral_weight_profile + ";kv:" + spectral_kv_profile;
+}
 
 static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_params & params) {
     std::vector<cmd_params_instance> instances;
@@ -1222,6 +1378,10 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & nub : params.n_ubatch)
     for (const auto & tk : params.type_k)
     for (const auto & tv : params.type_v)
+    for (const auto & swc : params.spectral_weight_calibration)
+    for (const auto & skc : params.spectral_kv_calibration)
+    for (const auto & swp : params.spectral_weight_profile)
+    for (const auto & skp : params.spectral_kv_profile)
     for (const auto & nkvo : params.no_kv_offload)
     for (const auto & fa : params.flash_attn)
     for (const auto & nt : params.n_threads)
@@ -1242,6 +1402,10 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .n_ubatch     = */ nub,
                 /* .type_k       = */ tk,
                 /* .type_v       = */ tv,
+                /* .spectral_weight_calibration = */ swc,
+                /* .spectral_kv_calibration     = */ skc,
+                /* .spectral_weight_profile     = */ swp,
+                /* .spectral_kv_profile         = */ skp,
                 /* .n_threads    = */ nt,
                 /* .cpu_mask     = */ cm,
                 /* .cpu_strict   = */ cs,
@@ -1277,6 +1441,10 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .n_ubatch     = */ nub,
                 /* .type_k       = */ tk,
                 /* .type_v       = */ tv,
+                /* .spectral_weight_calibration = */ swc,
+                /* .spectral_kv_calibration     = */ skc,
+                /* .spectral_weight_profile     = */ swp,
+                /* .spectral_kv_profile         = */ skp,
                 /* .n_threads    = */ nt,
                 /* .cpu_mask     = */ cm,
                 /* .cpu_strict   = */ cs,
@@ -1312,6 +1480,10 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .n_ubatch     = */ nub,
                 /* .type_k       = */ tk,
                 /* .type_v       = */ tv,
+                /* .spectral_weight_calibration = */ swc,
+                /* .spectral_kv_calibration     = */ skc,
+                /* .spectral_weight_profile     = */ swp,
+                /* .spectral_kv_profile         = */ skp,
                 /* .n_threads    = */ nt,
                 /* .cpu_mask     = */ cm,
                 /* .cpu_strict   = */ cs,
@@ -1347,6 +1519,11 @@ struct test {
     std::string              model_filename;
     std::string              model_type;
     uint64_t                 model_size;
+    uint64_t                 spectral_runtime_size;
+    uint64_t                 context_size;
+    uint64_t                 compute_size;
+    uint64_t                 runtime_size;
+    uint64_t                 runtime_size_effective;
     uint64_t                 model_n_params;
     int                      n_batch;
     int                      n_ubatch;
@@ -1356,6 +1533,8 @@ struct test {
     int                      poll;
     ggml_type                type_k;
     ggml_type                type_v;
+    std::string              spectral_calibration;
+    std::string              spectral_profile;
     int                      n_gpu_layers;
     int                      n_cpu_moe;
     llama_split_mode         split_mode;
@@ -1385,6 +1564,11 @@ struct test {
         llama_model_desc(lmodel, buf, sizeof(buf));
         model_type     = buf;
         model_size     = llama_model_size(lmodel);
+        spectral_runtime_size = llama_model_spectral_runtime_size(lmodel);
+        context_size   = llama_context_memory_size(ctx);
+        compute_size   = llama_context_compute_size(ctx);
+        runtime_size   = model_size + context_size + compute_size;
+        runtime_size_effective = runtime_size + spectral_runtime_size;
         model_n_params = llama_model_n_params(lmodel);
         n_batch        = inst.n_batch;
         n_ubatch       = inst.n_ubatch;
@@ -1394,6 +1578,8 @@ struct test {
         poll           = inst.poll;
         type_k         = inst.type_k;
         type_v         = inst.type_v;
+        spectral_calibration = spectral_calibration_display(inst.spectral_weight_calibration, inst.spectral_kv_calibration);
+        spectral_profile     = spectral_profile_display(inst.spectral_weight_profile, inst.spectral_kv_profile);
         n_gpu_layers   = inst.n_gpu_layers;
         n_cpu_moe      = inst.n_cpu_moe;
         split_mode     = inst.split_mode;
@@ -1460,10 +1646,12 @@ struct test {
     static const std::vector<std::string> & get_fields() {
         static const std::vector<std::string> fields = {
             "build_commit",   "build_number",   "cpu_info",      "gpu_info",       "backends",
-            "model_filename", "model_type",     "model_size",    "model_n_params", "n_batch",
+            "model_filename", "model_type",     "model_size",    "spectral_runtime_size", "context_size",   "compute_size",
+            "runtime_size",   "runtime_size_effective", "model_n_params", "n_batch",
             "n_ubatch",       "n_threads",      "cpu_mask",      "cpu_strict",     "poll",
-            "type_k",         "type_v",         "n_gpu_layers",  "n_cpu_moe",      "split_mode",
-            "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
+            "type_k",         "type_v",         "spectral_calibration", "spectral_profile",
+            "n_gpu_layers",   "n_cpu_moe",      "split_mode",    "main_gpu",       "no_kv_offload",
+            "flash_attn",     "devices",        "tensor_split",
             "tensor_buft_overrides",            "use_mmap",      "use_direct_io",  "embeddings",
             "no_op_offload",  "no_host",        "n_prompt",      "n_gen",          "n_depth",
             "test_time",      "avg_ns",         "stddev_ns",     "avg_ts",         "stddev_ts"
@@ -1475,7 +1663,8 @@ struct test {
 
     static field_type get_field_type(const std::string & field) {
         if (field == "build_number" || field == "n_batch" || field == "n_ubatch" || field == "n_threads" ||
-            field == "poll" || field == "model_size" || field == "model_n_params" || field == "n_gpu_layers" ||
+            field == "poll" || field == "model_size" || field == "spectral_runtime_size" || field == "context_size" || field == "compute_size" ||
+            field == "runtime_size" || field == "runtime_size_effective" || field == "model_n_params" || field == "n_gpu_layers" ||
             field == "main_gpu" || field == "n_prompt" || field == "n_gen" || field == "n_depth" || field == "avg_ns" ||
             field == "stddev_ns" || field == "no_op_offload" || field == "n_cpu_moe") {
             return INT;
@@ -1535,6 +1724,11 @@ struct test {
                                             model_filename,
                                             model_type,
                                             std::to_string(model_size),
+                                            std::to_string(spectral_runtime_size),
+                                            std::to_string(context_size),
+                                            std::to_string(compute_size),
+                                            std::to_string(runtime_size),
+                                            std::to_string(runtime_size_effective),
                                             std::to_string(model_n_params),
                                             std::to_string(n_batch),
                                             std::to_string(n_ubatch),
@@ -1544,6 +1738,8 @@ struct test {
                                             std::to_string(poll),
                                             ggml_type_name(type_k),
                                             ggml_type_name(type_v),
+                                            spectral_calibration,
+                                            spectral_profile,
                                             std::to_string(n_gpu_layers),
                                             std::to_string(n_cpu_moe),
                                             split_mode_str(split_mode),
@@ -1842,6 +2038,14 @@ struct markdown_printer : public printer {
         }
         if (params.type_v.size() > 1 || params.type_v != cmd_params_defaults.type_v) {
             fields.emplace_back("type_v");
+        }
+        if (params.spectral_weight_calibration.size() > 1 || params.spectral_weight_calibration != cmd_params_defaults.spectral_weight_calibration ||
+            params.spectral_kv_calibration.size() > 1 || params.spectral_kv_calibration != cmd_params_defaults.spectral_kv_calibration) {
+            fields.emplace_back("spectral_calibration");
+        }
+        if (params.spectral_weight_profile.size() > 1 || params.spectral_weight_profile != cmd_params_defaults.spectral_weight_profile ||
+            params.spectral_kv_profile.size() > 1 || params.spectral_kv_profile != cmd_params_defaults.spectral_kv_profile) {
+            fields.emplace_back("spectral_profile");
         }
         if (params.main_gpu.size() > 1 || params.main_gpu != cmd_params_defaults.main_gpu) {
             fields.emplace_back("main_gpu");

@@ -17,6 +17,7 @@ class llama_batch_allocr;
 
 class llama_io_read_i;
 class llama_io_write_i;
+struct llama_spectral_artifact;
 
 // "memory" as in abstract memory for the context
 struct llama_memory_i;
@@ -264,6 +265,7 @@ private:
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
     std::unique_ptr<llama_memory_i> memory;
+    std::unique_ptr<llama_spectral_artifact> spectral_kv_artifact;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};

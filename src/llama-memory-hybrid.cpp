@@ -13,6 +13,8 @@ llama_memory_hybrid::llama_memory_hybrid(
                             /* attn */
                 ggml_type   type_k,
                 ggml_type   type_v,
+    const llama_spectral_artifact * spectral_artifact,
+                  const char * spectral_profile,
                      bool   v_trans,
                  uint32_t   kv_size,
                  uint32_t   n_pad,
@@ -34,6 +36,8 @@ llama_memory_hybrid::llama_memory_hybrid(
         model,
         type_k,
         type_v,
+        spectral_artifact,
+        spectral_profile,
         v_trans,
         offload,
         unified,

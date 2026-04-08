@@ -1449,6 +1449,8 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.progress_callback           = params.load_progress_callback;
     mparams.progress_callback_user_data = params.load_progress_callback_user_data;
     mparams.no_alloc                    = params.no_alloc;
+    mparams.spectral_calibration        = params.spectral_calibration.empty() ? nullptr : params.spectral_calibration.c_str();
+    mparams.spectral_profile            = params.spectral_profile.empty() ? nullptr : params.spectral_profile.c_str();
 
     return mparams;
 }
@@ -1485,6 +1487,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
+    cparams.spectral_calibration = params.spectral_calibration.empty() ? nullptr : params.spectral_calibration.c_str();
+    cparams.spectral_profile     = params.spectral_profile.empty() ? nullptr : params.spectral_profile.c_str();
 
     return cparams;
 }

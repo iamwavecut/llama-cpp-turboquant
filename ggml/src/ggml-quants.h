@@ -120,6 +120,27 @@ GGML_API void quantize_row_tq4_1s_ref(const float * GGML_RESTRICT x, block_tq4_1
 GGML_API void dequantize_row_tq4_1s(const block_tq4_1s * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API size_t quantize_tq4_1s(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
 
+// SpectralQuant SQ2_0 / SQ3_1S / SQ4_1S weight dequantization
+GGML_API void dequantize_row_sq2_0(const block_sq2_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+GGML_API void dequantize_row_sq3_1s(const block_sq3_1s * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+GGML_API void dequantize_row_sq4_1s(const block_sq4_1s * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+GGML_API bool ggml_sq_vec_dot_f32(enum ggml_type type, const void * GGML_RESTRICT vx, const float * GGML_RESTRICT vy, int64_t n, float * GGML_RESTRICT s);
+GGML_API void ggml_sq_vec_cache_reset(void);
+
+// SpectralQuant SKV2_0 / SKV3_0 / SKV4_0 KV-cache quantization
+GGML_API void quantize_row_skv2_0_ref(const float * GGML_RESTRICT x, block_skv2_0 * GGML_RESTRICT y, int64_t k);
+GGML_API void quantize_row_skv3_0_ref(const float * GGML_RESTRICT x, block_skv3_0 * GGML_RESTRICT y, int64_t k);
+GGML_API void quantize_row_skv4_0_ref(const float * GGML_RESTRICT x, block_skv4_0 * GGML_RESTRICT y, int64_t k);
+GGML_API void dequantize_row_skv2_0(const block_skv2_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+GGML_API void dequantize_row_skv3_0(const block_skv3_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+GGML_API void dequantize_row_skv4_0(const block_skv4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+GGML_API void ggml_vec_dot_skv2_0_f32(int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+GGML_API void ggml_vec_dot_skv3_0_f32(int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+GGML_API void ggml_vec_dot_skv4_0_f32(int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+
 GGML_API void iq2xs_init_impl(enum ggml_type type);
 GGML_API void iq2xs_free_impl(enum ggml_type type);
 GGML_API void iq3xs_init_impl(int grid_size);

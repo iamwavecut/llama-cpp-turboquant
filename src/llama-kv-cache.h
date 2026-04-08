@@ -4,6 +4,7 @@
 #include "llama-graph.h"
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
+#include "llama-spectral.h"
 
 #include <unordered_map>
 #include <vector>
@@ -97,6 +98,8 @@ public:
             const llama_model & model,
                     ggml_type   type_k,
                     ggml_type   type_v,
+    const llama_spectral_artifact * spectral_artifact,
+                  const char * spectral_profile,
                          bool   v_trans,
                          bool   offload,
                          bool   unified,
@@ -108,7 +111,7 @@ public:
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse);
 
-    ~llama_kv_cache() = default;
+    ~llama_kv_cache();
 
     //
     // llama_memory_i
@@ -281,6 +284,31 @@ private:
     // TurboQuant InnerQ: per-channel scale_inv for Q/V equalization (128 floats)
     ggml_tensor * turbo_innerq_scale_inv = nullptr;
 
+    struct spectral_kv_head_runtime {
+        llama_spectral_entry * entry = nullptr;
+        std::vector<float> qjl_matrix;
+    };
+
+    struct spectral_kv_runtime {
+        ggml_tensor * tensor = nullptr;
+        ggml_type type = GGML_TYPE_F16;
+        uint32_t il = 0;
+        uint32_t n_head = 0;
+        uint32_t head_dim = 0;
+        uint32_t head_dim_padded = 0;
+        bool is_key = false;
+        bool use_correction = false;
+        uint32_t qjl_bytes_per_head = 0;
+        std::vector<llama_spectral_entry> prepared_entries;
+        std::vector<spectral_kv_head_runtime> heads;
+        std::vector<ggml_spectral_kv_head_meta> head_meta;
+        std::vector<float> vec_norms;
+        std::vector<float> residual_norms;
+        std::vector<uint8_t> qjl_signs;
+    };
+
+    std::vector<spectral_kv_runtime> spectral_kv_runtime;
+
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
 
@@ -312,9 +340,11 @@ private:
 
     void state_write_meta(llama_io_write_i & io, const cell_ranges_t & cr, llama_seq_id seq_id = -1) const;
     void state_write_data(llama_io_write_i & io, const cell_ranges_t & cr) const;
+    void state_write_spectral_data(llama_io_write_i & io, const cell_ranges_t & cr) const;
 
     bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,       slot_info & sinfo, llama_seq_id dest_seq_id = -1);
     bool state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo);
+    bool state_read_spectral_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo);
 };
 
 class llama_kv_cache_context : public llama_memory_context_i {

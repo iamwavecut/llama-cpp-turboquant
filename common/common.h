@@ -343,6 +343,8 @@ struct common_params_speculative {
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
+    std::string spectral_calibration;       // spectral calibration GGUF sidecar for SKV runtime
+    std::string spectral_profile = "auto";  // spectral profile filter: auto, nonuniform, selcorr, all
 
     struct cpu_params cpuparams;
     struct cpu_params cpuparams_batch;
@@ -548,6 +550,8 @@ struct common_params {
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
+    std::string spectral_calibration;       // spectral calibration GGUF sidecar for SKV runtime
+    std::string spectral_profile = "auto";  // spectral profile filter: auto, nonuniform, selcorr, all
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 

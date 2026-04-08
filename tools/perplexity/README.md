@@ -10,6 +10,17 @@ The convention among contributors is to use the Wikitext-2 test set for testing 
 When numbers are listed all command line arguments and compilation options are left at their defaults unless noted otherwise.
 llama.cpp numbers are **not** directly comparable to those of other projects because the exact values depend strongly on the implementation details.
 
+This fork also exposes SpectralQuant runtime flags through the shared common CLI:
+
+- `-ctk/-ctv skv2_0|skv3_0|skv4_0` to enable spectral KV cache layouts
+- `--spectral-calibration <sidecar.gguf>` to load the spectral calibration sidecar for SQ and/or SKV runtime paths
+- `--spectral-profile <auto|all|nonuniform|selcorr>` to select the runtime policy (`selcorr` remains `K`-only, matching the SpectralQuant paper)
+- `SKV*` requires `--no-kv-offload` in this implementation because spectral KV is still CPU-only
+- `SQ*` model comparisons should use `-ngl 0` because spectral weights are still CPU-only
+
+For paper-style acceptance sweeps, use `scripts/spectralquant-perplexity-matrix.py`, which runs a baseline logits pass and then compares `legacy`, `SQ-noQJL`-like (`nonuniform`), and `SQ-selQJL`-like (`selcorr`) configurations through the built-in KL-divergence path.
+Add `--require-kld-metrics` when you want the script to fail if a spectral scenario stops emitting KL/PPL-ratio metrics.
+
 By default only the mean perplexity value and the corresponding uncertainty is calculated.
 The uncertainty is determined empirically by assuming a Gaussian distribution of the "correct" logits per and then applying error propagation.
 

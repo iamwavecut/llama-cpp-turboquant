@@ -156,6 +156,9 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_NVFP4         = 39, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_TQ3_1S        = 43, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_TQ4_1S        = 44, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_SQ2_0         = 45, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_SQ3_1S        = 46, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_SQ4_1S        = 47, // except 1d tensors
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };
@@ -310,6 +313,9 @@ extern "C" {
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
 
+        const char * spectral_calibration; // optional spectral calibration GGUF sidecar for SQ* weight runtime
+        const char * spectral_profile;     // optional spectral profile filter: auto, nonuniform, selcorr, all
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
         bool use_mmap;        // use mmap if possible
@@ -356,6 +362,8 @@ extern "C" {
 
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
+        const char * spectral_calibration; // optional spectral calibration GGUF sidecar for SKV* runtime
+        const char * spectral_profile;     // optional spectral profile filter: auto, nonuniform, selcorr, all
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
@@ -409,6 +417,8 @@ extern "C" {
         const struct llama_model_kv_override * kv_overrides;        // pointer to kv overrides
         const struct llama_model_tensor_override * tt_overrides;    // pointer to tensor overrides
         const int32_t * prune_layers;                               // pointer to layer indices to prune
+        const char * spectral_calibration;                          // optional spectral calibration GGUF sidecar to embed into output model metadata
+        const char * spectral_profile;                              // optional spectral profile filter: all, nonuniform, selcorr
     } llama_model_quantize_params;
 
     typedef struct llama_logit_bias {
@@ -561,6 +571,11 @@ extern "C" {
 
     LLAMA_API const struct llama_model * llama_get_model   (const struct llama_context * ctx);
     LLAMA_API           llama_memory_t   llama_get_memory  (const struct llama_context * ctx);
+    // Returns the total size of persistent non-model memory owned by the context in bytes
+    // (for example KV cache and output buffers).
+    LLAMA_API uint64_t llama_context_memory_size (const struct llama_context * ctx);
+    // Returns the total size of temporary compute buffers owned by the context in bytes.
+    LLAMA_API uint64_t llama_context_compute_size(const struct llama_context * ctx);
     LLAMA_API  enum llama_pooling_type   llama_pooling_type(const struct llama_context * ctx); // TODO: rename to llama_get_pooling_type
 
     LLAMA_API const struct llama_vocab * llama_model_get_vocab(const struct llama_model * model);
@@ -615,6 +630,7 @@ extern "C" {
 
     // Returns the total size of all the tensors in the model in bytes
     LLAMA_API uint64_t llama_model_size(const struct llama_model * model);
+    LLAMA_API uint64_t llama_model_spectral_runtime_size(const struct llama_model * model);
 
     // Get the default chat template. Returns nullptr if not available
     // If name is NULL, returns the default chat template

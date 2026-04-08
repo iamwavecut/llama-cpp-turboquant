@@ -7,6 +7,7 @@
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
+#include "llama-spectral.h"
 #include "llama-ext.h"
 
 #include <cinttypes>
@@ -14,6 +15,10 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+
+static bool llama_type_is_skv_cache(ggml_type type) {
+    return type == GGML_TYPE_SKV2_0 || type == GGML_TYPE_SKV3_0 || type == GGML_TYPE_SKV4_0;
+}
 
 //
 // llama_context
@@ -62,6 +67,8 @@ llama_context::llama_context(
 
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
+    cparams.spectral_calibration = params.spectral_calibration ? params.spectral_calibration : "";
+    cparams.spectral_profile = params.spectral_profile ? params.spectral_profile : "auto";
 
     // Initialize backend samplers here so they are part of the sampling graph
     // before the reserve passes run later in this function. This avoids a later
@@ -272,10 +279,47 @@ llama_context::llama_context(
 
     // init the memory module
     if (!hparams.vocab_only) {
+        const bool uses_spectral_kv = llama_type_is_skv_cache(params.type_k) || llama_type_is_skv_cache(params.type_v);
+        if (uses_spectral_kv) {
+            if (params.spectral_calibration == nullptr || params.spectral_calibration[0] == '\0') {
+                throw std::runtime_error("SKV cache types require --spectral-calibration");
+            }
+
+            spectral_kv_artifact = std::make_unique<llama_spectral_artifact>();
+            std::string spectral_err;
+            if (!llama_spectral_load_gguf(params.spectral_calibration, *spectral_kv_artifact, &spectral_err)) {
+                throw std::runtime_error("failed to load spectral calibration: " + spectral_err);
+            }
+            if (!llama_spectral_validate_artifact(*spectral_kv_artifact, &spectral_err)) {
+                throw std::runtime_error("invalid spectral calibration: " + spectral_err);
+            }
+            if (!spectral_kv_artifact->source_architecture.empty() &&
+                spectral_kv_artifact->source_architecture != model.arch_name()) {
+                throw std::runtime_error(format("spectral calibration architecture mismatch: %s != %s",
+                        spectral_kv_artifact->source_architecture.c_str(), model.arch_name().c_str()));
+            }
+            if (!spectral_kv_artifact->source_digest.empty()) {
+                std::vector<const ggml_tensor *> model_tensors;
+                const auto & tensor_map = llama_internal_get_tensor_map(&model);
+                model_tensors.reserve(tensor_map.size());
+                for (const auto & [_, tensor] : tensor_map) {
+                    model_tensors.push_back(tensor);
+                }
+
+                const std::string model_digest = llama_spectral_compute_tensor_digest(model.arch_name().c_str(), model_tensors);
+                if (model_digest != spectral_kv_artifact->source_digest) {
+                    throw std::runtime_error(format("spectral calibration digest mismatch: artifact=%s model=%s",
+                            spectral_kv_artifact->source_digest.c_str(), model_digest.c_str()));
+                }
+            }
+        }
+
         llama_memory_params params_mem = {
-            /*.type_k   =*/ params.type_k,
-            /*.type_v   =*/ params.type_v,
-            /*.swa_full =*/ params.swa_full,
+            /*.type_k           =*/ params.type_k,
+            /*.type_v           =*/ params.type_v,
+            /*.spectral_kv      =*/ spectral_kv_artifact.get(),
+            /*.spectral_profile =*/ cparams.spectral_profile.c_str(),
+            /*.swa_full         =*/ params.swa_full,
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
@@ -2642,6 +2686,9 @@ std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data> llama_context:
             ret[buft].context += size;
         }
     }
+    if (buf_output) {
+        ret[ggml_backend_buffer_get_type(buf_output.get())].context += ggml_backend_buffer_get_size(buf_output.get());
+    }
     if (model.hparams.no_alloc) {
         for (size_t i = 0; i < backends.size(); ++i) {
             ggml_backend_t             backend = backends[i].get();
@@ -2904,6 +2951,8 @@ llama_context_params llama_context_default_params() {
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
+        /*.spectral_calibration        =*/ nullptr,
+        /*.spectral_profile            =*/ nullptr,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,
@@ -2947,11 +2996,14 @@ llama_context * llama_init_from_model(
         const bool k_is_turbo = (params.type_k == GGML_TYPE_TURBO2_0 ||
                                  params.type_k == GGML_TYPE_TURBO3_0 ||
                                  params.type_k == GGML_TYPE_TURBO4_0);
+        const bool k_is_skv = llama_type_is_skv_cache(params.type_k);
         for (uint32_t il = 0; il < model->hparams.n_layer; ++il) {
             uint32_t head_k = model->hparams.n_embd_head_k(il);
             // Turbo types zero-pad heads to next multiple of 128 in llama-kv-cache.cpp
             if (k_is_turbo && head_k % 128 != 0) {
                 head_k = ((head_k + 127) / 128) * 128;
+            } else if (k_is_skv && head_k % blck_size != 0) {
+                head_k = GGML_PAD(head_k, blck_size);
             }
             if (head_k % blck_size != 0) {
                 LLAMA_LOG_ERROR("%s: K cache type %s with block size %u does not divide n_embd_head_k=%u\n",
@@ -2966,12 +3018,15 @@ llama_context * llama_init_from_model(
         const bool v_is_turbo = (params.type_v == GGML_TYPE_TURBO2_0 ||
                                  params.type_v == GGML_TYPE_TURBO3_0 ||
                                  params.type_v == GGML_TYPE_TURBO4_0);
+        const bool v_is_skv = llama_type_is_skv_cache(params.type_v);
         const bool is_mla = model->hparams.is_mla();
         for (uint32_t il = 0; il < model->hparams.n_layer; ++il) {
             uint32_t head_v = model->hparams.n_embd_head_v(il);
             // Turbo types zero-pad; MLA has no separate V cache (V = view of K)
             if (v_is_turbo && !is_mla && head_v % 128 != 0) {
                 head_v = ((head_v + 127) / 128) * 128;
+            } else if (v_is_skv && !is_mla && head_v % blck_size != 0) {
+                head_v = GGML_PAD(head_v, blck_size);
             }
             if (head_v % blck_size != 0) {
                 LLAMA_LOG_ERROR("%s: V cache type %s with block size %u does not divide n_embd_head_v=%u\n",
@@ -2991,6 +3046,14 @@ llama_context * llama_init_from_model(
 
     if (ggml_is_quantized(params.type_v) && params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
         LLAMA_LOG_ERROR("%s: V cache quantization requires flash_attn\n", __func__);
+        return nullptr;
+    }
+
+    if ((llama_type_is_skv_cache(params.type_k) || llama_type_is_skv_cache(params.type_v)) && !params.offload_kqv) {
+        LLAMA_LOG_INFO("%s: SKV cache types selected for CPU runtime\n", __func__);
+    }
+    if ((llama_type_is_skv_cache(params.type_k) || llama_type_is_skv_cache(params.type_v)) && params.offload_kqv) {
+        LLAMA_LOG_ERROR("%s: SKV cache types are CPU-only in this implementation; disable KV offload\n", __func__);
         return nullptr;
     }
 
@@ -3222,8 +3285,34 @@ int32_t llama_set_adapter_cvec(
 // memory
 //
 
+static uint64_t llama_context_breakdown_sum(const llama_context * ctx, bool include_context, bool include_compute) {
+    if (!ctx) {
+        return 0;
+    }
+
+    uint64_t total = 0;
+    for (const auto & [_, mb] : ctx->memory_breakdown()) {
+        if (include_context) {
+            total += mb.context;
+        }
+        if (include_compute) {
+            total += mb.compute;
+        }
+    }
+
+    return total;
+}
+
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {
     return ctx->get_memory();
+}
+
+uint64_t llama_context_memory_size(const struct llama_context * ctx) {
+    return llama_context_breakdown_sum(ctx, true, false);
+}
+
+uint64_t llama_context_compute_size(const struct llama_context * ctx) {
+    return llama_context_breakdown_sum(ctx, false, true);
 }
 
 void llama_memory_clear(llama_memory_t mem, bool data) {

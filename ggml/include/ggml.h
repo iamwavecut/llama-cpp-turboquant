@@ -433,7 +433,13 @@ extern "C" {
         GGML_TYPE_TURBO2_0 = 43, // TurboQuant 2-bit KV cache: 2-bit PolarQuant (no QJL)
         GGML_TYPE_TQ3_1S  = 44, // TurboQuant 3-bit weight: WHT-rotated 8-level Lloyd-Max, block_size=32
         GGML_TYPE_TQ4_1S  = 45, // TurboQuant 4-bit weight: WHT-rotated 16-level Lloyd-Max, block_size=32
-        GGML_TYPE_COUNT   = 46,
+        GGML_TYPE_SQ2_0   = 46, // SpectralQuant 2-bit weight: spectral-domain non-uniform codes + semantic correction
+        GGML_TYPE_SQ3_1S  = 47, // SpectralQuant 3-bit weight: spectral-domain non-uniform codes + semantic correction
+        GGML_TYPE_SQ4_1S  = 48, // SpectralQuant 4-bit weight: spectral-domain non-uniform codes + semantic correction
+        GGML_TYPE_SKV2_0  = 49, // SpectralQuant 2-bit KV cache: separate semantic/tail codebooks
+        GGML_TYPE_SKV3_0  = 50, // SpectralQuant 3-bit KV cache: separate semantic/tail codebooks
+        GGML_TYPE_SKV4_0  = 51, // SpectralQuant 4-bit KV cache: separate semantic/tail codebooks
+        GGML_TYPE_COUNT   = 52,
     };
 
     // precision
@@ -2716,6 +2722,67 @@ extern "C" {
                    int64_t   nrows,
                    int64_t   n_per_row,
                const float * imatrix);
+
+    struct ggml_spectral_weight_meta {
+        uint32_t     dim;
+        uint32_t     split;
+        uint32_t     correction_dim;
+        uint32_t     semantic_codebook_size;
+        uint32_t     tail_codebook_size;
+        const float * basis;
+        const float * semantic_codebook;
+        const float * tail_codebook;
+    };
+
+    GGML_API bool ggml_is_spectral_weight_type(enum ggml_type type);
+    GGML_API size_t ggml_quantize_spectral_weight(
+            enum ggml_type type,
+            const float * src,
+            void * dst,
+            int64_t nrows,
+            int64_t n_per_row,
+            const struct ggml_spectral_weight_meta * meta);
+    GGML_API bool ggml_spectral_register_tensor(
+            const void * owner,
+            const void * data,
+            size_t size,
+            enum ggml_type type,
+            const struct ggml_spectral_weight_meta * meta);
+    GGML_API void ggml_spectral_unregister_owner(const void * owner);
+
+    struct ggml_spectral_kv_head_meta {
+        uint32_t     dim;
+        uint32_t     split;
+        uint32_t     semantic_codebook_size;
+        uint32_t     tail_codebook_size;
+        const float * basis;
+        const float * semantic_codebook;
+        const float * tail_codebook;
+        const float * qjl_matrix;
+    };
+
+    struct ggml_spectral_kv_meta {
+        bool                                 is_key;
+        bool                                 use_correction;
+        uint32_t                             n_head;
+        uint32_t                             head_dim;
+        uint32_t                             head_dim_padded;
+        uint32_t                             n_rows;
+        uint32_t                             qjl_bytes_per_head;
+        const struct ggml_spectral_kv_head_meta * heads;
+        float                              * vec_norms;
+        float                              * residual_norms;
+        uint8_t                            * qjl_signs;
+    };
+
+    GGML_API bool ggml_is_spectral_kv_type(enum ggml_type type);
+    GGML_API bool ggml_spectral_kv_register_tensor(
+            const void * owner,
+            void * data,
+            size_t size,
+            enum ggml_type type,
+            const struct ggml_spectral_kv_meta * meta);
+    GGML_API void ggml_spectral_kv_unregister_owner(const void * owner);
 
 #ifdef __cplusplus
     // restrict not standard in C++

@@ -13,6 +13,10 @@
 #include <map>
 #include <stdexcept>
 
+static constexpr uint32_t LLAMA_SKV_BLOCK_SIZE = 32;
+static constexpr uint32_t LLAMA_SKV_STATE_MAGIC = 0x534b5631u; // "SKV1"
+static constexpr uint32_t LLAMA_SKV_STATE_VERSION = 1;
+
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
 }
@@ -72,6 +76,103 @@ static ggml_tensor * ggml_mul_mat_aux(
     return res;
 }
 
+static bool llama_kv_type_is_turbo(ggml_type type) {
+    return type == GGML_TYPE_TURBO3_0 || type == GGML_TYPE_TURBO4_0 || type == GGML_TYPE_TURBO2_0;
+}
+
+static bool llama_kv_type_is_skv(ggml_type type) {
+    return type == GGML_TYPE_SKV2_0 || type == GGML_TYPE_SKV3_0 || type == GGML_TYPE_SKV4_0;
+}
+
+static bool spectral_profile_is_explicit(const char * profile_text) {
+    if (profile_text == nullptr || profile_text[0] == '\0') {
+        return false;
+    }
+    return std::strcmp(profile_text, "all") != 0 && std::strcmp(profile_text, "auto") != 0;
+}
+
+static const llama_spectral_entry * find_spectral_kv_entry(
+        const llama_spectral_artifact * artifact,
+        llama_spectral_kind kind,
+        const std::string & base_name,
+        uint32_t head,
+        uint32_t n_head,
+        const char * requested_profile) {
+    if (artifact == nullptr) {
+        return nullptr;
+    }
+
+    std::vector<llama_spectral_profile> profile_order;
+    if (spectral_profile_is_explicit(requested_profile)) {
+        llama_spectral_profile parsed;
+        if (llama_spectral_profile_parse(requested_profile, parsed)) {
+            if (kind == LLAMA_SPECTRAL_KIND_V && parsed == LLAMA_SPECTRAL_PROFILE_ROTATION_NONUNIFORM_SELCORR) {
+                // SpectralQuant keeps selective correction on K only; explicit "selcorr"
+                // for V still maps to the paper-aligned nonuniform reconstruction path.
+                profile_order.push_back(LLAMA_SPECTRAL_PROFILE_ROTATION_NONUNIFORM);
+            } else {
+                profile_order.push_back(parsed);
+            }
+        }
+    } else if (kind == LLAMA_SPECTRAL_KIND_K) {
+        profile_order.push_back(LLAMA_SPECTRAL_PROFILE_ROTATION_NONUNIFORM_SELCORR);
+        profile_order.push_back(LLAMA_SPECTRAL_PROFILE_ROTATION_NONUNIFORM);
+    } else {
+        profile_order.push_back(LLAMA_SPECTRAL_PROFILE_ROTATION_NONUNIFORM);
+        profile_order.push_back(LLAMA_SPECTRAL_PROFILE_ROTATION_NONUNIFORM_SELCORR);
+    }
+
+    if (profile_order.empty()) {
+        profile_order.push_back(LLAMA_SPECTRAL_PROFILE_ROTATION_NONUNIFORM);
+        profile_order.push_back(LLAMA_SPECTRAL_PROFILE_ROTATION_NONUNIFORM_SELCORR);
+    }
+
+    const std::vector<std::string> names = {
+        base_name + ".h" + std::to_string(head),
+        base_name + "_h" + std::to_string(head),
+        base_name + "/h" + std::to_string(head),
+        n_head == 1 ? base_name : ""
+    };
+
+    for (const auto profile : profile_order) {
+        for (const auto & name : names) {
+            if (name.empty()) {
+                continue;
+            }
+            for (const auto & entry : artifact->entries) {
+                if (entry.kind == kind && entry.profile == profile && entry.name == name) {
+                    return &entry;
+                }
+            }
+        }
+    }
+
+    return nullptr;
+}
+
+static double spectral_qjl_normal(uint64_t & state) {
+    constexpr double two_pi = 6.28318530717958647692;
+    state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+    double u1 = (double) (state >> 11) / (double) (1ULL << 53);
+    if (u1 < 1e-15) {
+        u1 = 1e-15;
+    }
+    state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+    const double u2 = (double) (state >> 11) / (double) (1ULL << 53);
+    return std::sqrt(-2.0 * std::log(u1)) * std::cos(two_pi * u2);
+}
+
+static std::vector<float> build_spectral_qjl_matrix(uint32_t head_dim, uint32_t split) {
+    std::vector<float> result(size_t(split) * split, 0.0f);
+    uint64_t state = 1042ULL + head_dim * 1315423911ULL;
+    for (uint32_t row = 0; row < split; ++row) {
+        for (uint32_t col = 0; col < split; ++col) {
+            result[size_t(row) * split + col] = (float) spectral_qjl_normal(state);
+        }
+    }
+    return result;
+}
+
 // InnerQ: cross-TU shared state for CUDA per-channel equalization.
 // These are defined in ggml-cuda/turbo-innerq.cu (when CUDA is enabled).
 // When CUDA is not available, we provide stub implementations.
@@ -104,6 +205,8 @@ llama_kv_cache::llama_kv_cache(
         const llama_model & model,
                 ggml_type   type_k,
                 ggml_type   type_v,
+    const llama_spectral_artifact * spectral_artifact,
+              const char * spectral_profile,
                      bool   v_trans,
                      bool   offload,
                      bool   unified,
@@ -120,6 +223,16 @@ llama_kv_cache::llama_kv_cache(
     GGML_ASSERT(kv_size % n_pad == 0);
 
     const uint32_t n_layer_kv = hparams.n_layer_kv();
+    const bool uses_spectral_kv = llama_kv_type_is_skv(type_k) || llama_kv_type_is_skv(type_v);
+
+    if (uses_spectral_kv) {
+        if (offload) {
+            throw std::runtime_error("SKV cache types are CPU-only in this implementation");
+        }
+        if (spectral_artifact == nullptr) {
+            throw std::runtime_error("missing spectral KV calibration artifact");
+        }
+    }
 
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
     struct ggml_backend_buft_comparator {
@@ -253,33 +366,33 @@ llama_kv_cache::llama_kv_cache(
                 }
                 return 0;
             }();
-            const bool is_turbo = (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 || type_k == GGML_TYPE_TURBO2_0);
-            const bool v_is_turbo = (type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO4_0 || type_v == GGML_TYPE_TURBO2_0);
+            const bool is_turbo = llama_kv_type_is_turbo(type_k);
+            const bool v_is_turbo = llama_kv_type_is_turbo(type_v);
             const uint32_t n_layer = hparams.n_layer;
-            if (adaptive_mode == 1 && is_turbo && n_layer >= 8) {
+            if (!uses_spectral_kv && adaptive_mode == 1 && is_turbo && n_layer >= 8) {
                 if (il < 4 || il >= n_layer - 4) {
                     layer_type_k = GGML_TYPE_Q8_0;
                     layer_type_v = GGML_TYPE_Q8_0;
                 }
-            } else if (adaptive_mode == 2 && is_turbo && n_layer >= 8) {
+            } else if (!uses_spectral_kv && adaptive_mode == 2 && is_turbo && n_layer >= 8) {
                 if (il >= n_layer - 8) {
                     layer_type_k = GGML_TYPE_Q8_0;
                     layer_type_v = GGML_TYPE_Q8_0;
                 }
-            } else if (adaptive_mode == 5 && v_is_turbo && n_layer >= 8) {
+            } else if (!uses_spectral_kv && adaptive_mode == 5 && v_is_turbo && n_layer >= 8) {
                 // Boundary V (turbo4 boundaries): first2+last2 V=turbo4, rest V=turbo2
                 const bool is_boundary = (il < 2 || il >= n_layer - 2);
                 layer_type_v = is_boundary ? GGML_TYPE_TURBO4_0 : GGML_TYPE_TURBO2_0;
                 if (il == 0) {
                     LLAMA_LOG_INFO("llama_kv_cache: Boundary V mode 5: first2+last2 V=turbo4, rest V=turbo2\n");
                 }
-            } else if (adaptive_mode == 6 && v_is_turbo && n_layer >= 8) {
+            } else if (!uses_spectral_kv && adaptive_mode == 6 && v_is_turbo && n_layer >= 8) {
                 // V-only: last 8 V=turbo4, rest V=turbo2
                 layer_type_v = (il >= n_layer - 8) ? GGML_TYPE_TURBO4_0 : GGML_TYPE_TURBO2_0;
                 if (il == 0) {
                     LLAMA_LOG_INFO("llama_kv_cache: V-only LA mode 6: last8 V=turbo4, rest V=turbo2\n");
                 }
-            } else if (adaptive_mode == 7 && v_is_turbo && n_layer >= 8) {
+            } else if (!uses_spectral_kv && adaptive_mode == 7 && v_is_turbo && n_layer >= 8) {
                 // Boundary V (recommended): first2+last2 V=q8_0, rest V=turbo2
                 const bool is_boundary = (il < 2 || il >= n_layer - 2);
                 layer_type_v = is_boundary ? GGML_TYPE_Q8_0 : GGML_TYPE_TURBO2_0;
@@ -290,7 +403,8 @@ llama_kv_cache::llama_kv_cache(
         }
         // For turbo types, pad K head_dim to next multiple of 128 for full WHT groups
         uint32_t n_embd_k_gqa_eff = n_embd_k_gqa;
-        const bool k_is_turbo = (layer_type_k == GGML_TYPE_TURBO3_0 || layer_type_k == GGML_TYPE_TURBO4_0 || layer_type_k == GGML_TYPE_TURBO2_0);
+        const bool k_is_turbo = llama_kv_type_is_turbo(layer_type_k);
+        const bool k_is_skv = llama_kv_type_is_skv(layer_type_k);
         if (k_is_turbo && n_embd_head_k % 128 != 0) {
             const uint32_t padded_head_k = ((n_embd_head_k + 127) / 128) * 128;
             const uint32_t n_head_kv = n_embd_k_gqa / n_embd_head_k;
@@ -299,18 +413,35 @@ llama_kv_cache::llama_kv_cache(
                 LLAMA_LOG_INFO("%s: turbo zero-padding K head_dim %u -> %u (cache %u -> %u)\n",
                                __func__, n_embd_head_k, padded_head_k, n_embd_k_gqa, n_embd_k_gqa_eff);
             }
+        } else if (k_is_skv && n_embd_head_k % LLAMA_SKV_BLOCK_SIZE != 0) {
+            const uint32_t padded_head_k = GGML_PAD(n_embd_head_k, LLAMA_SKV_BLOCK_SIZE);
+            const uint32_t n_head_kv = n_embd_k_gqa / n_embd_head_k;
+            n_embd_k_gqa_eff = n_head_kv * padded_head_k;
+            if (il == 0) {
+                LLAMA_LOG_INFO("%s: spectral zero-padding K head_dim %u -> %u (cache %u -> %u)\n",
+                               __func__, n_embd_head_k, padded_head_k, n_embd_k_gqa, n_embd_k_gqa_eff);
+            }
         }
 
         // For turbo types, pad V head_dim to next multiple of 128 if needed
         const uint32_t n_embd_head_v = hparams.n_embd_head_v(il);
         uint32_t n_embd_v_gqa_eff = n_embd_v_gqa;
-        const bool v_is_turbo = (layer_type_v == GGML_TYPE_TURBO3_0 || layer_type_v == GGML_TYPE_TURBO4_0 || layer_type_v == GGML_TYPE_TURBO2_0);
+        const bool v_is_turbo = llama_kv_type_is_turbo(layer_type_v);
+        const bool v_is_skv = llama_kv_type_is_skv(layer_type_v);
         if (v_is_turbo && !is_mla && n_embd_head_v % 128 != 0) {
             const uint32_t padded_head_v = ((n_embd_head_v + 127) / 128) * 128;
             const uint32_t n_head_kv = n_embd_v_gqa / n_embd_head_v;
             n_embd_v_gqa_eff = n_head_kv * padded_head_v;
             if (il == 0) {
                 LLAMA_LOG_INFO("%s: turbo zero-padding V head_dim %u -> %u (cache %u -> %u)\n",
+                               __func__, n_embd_head_v, padded_head_v, n_embd_v_gqa, n_embd_v_gqa_eff);
+            }
+        } else if (v_is_skv && !is_mla && n_embd_head_v % LLAMA_SKV_BLOCK_SIZE != 0) {
+            const uint32_t padded_head_v = GGML_PAD(n_embd_head_v, LLAMA_SKV_BLOCK_SIZE);
+            const uint32_t n_head_kv = n_embd_v_gqa / n_embd_head_v;
+            n_embd_v_gqa_eff = n_head_kv * padded_head_v;
+            if (il == 0) {
+                LLAMA_LOG_INFO("%s: spectral zero-padding V head_dim %u -> %u (cache %u -> %u)\n",
                                __func__, n_embd_head_v, padded_head_v, n_embd_v_gqa, n_embd_v_gqa_eff);
             }
         }
@@ -334,8 +465,7 @@ llama_kv_cache::llama_kv_cache(
         layers.push_back({ il, k, v, k_stream, v_stream, });
 
         // TurboQuant: create rotation matrix tensors (once, shared across layers)
-        if (turbo_rotation == nullptr &&
-            (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 || type_k == GGML_TYPE_TURBO2_0)) {
+        if (turbo_rotation == nullptr && llama_kv_type_is_turbo(type_k)) {
             turbo_rotation = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, 128);
             ggml_format_name(turbo_rotation, "turbo_rotation");  // R^T
             turbo_rotation_inv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, 128);
@@ -414,6 +544,104 @@ llama_kv_cache::llama_kv_cache(
         ctxs_bufs.emplace_back(std::move(ctx), buf);
     }
 
+    if (uses_spectral_kv) {
+        spectral_kv_runtime.clear();
+        spectral_kv_runtime.reserve(layers.size() * 2);
+        const uint32_t n_rows_total = kv_size * n_stream;
+
+        for (const auto & layer : layers) {
+            const uint32_t il = layer.il;
+
+            auto register_tensor = [&](ggml_tensor * tensor, llama_spectral_kind kind, uint32_t head_dim) {
+                if (tensor == nullptr || !llama_kv_type_is_skv(tensor->type)) {
+                    return;
+                }
+
+                struct spectral_kv_runtime local;
+                local.tensor = tensor;
+                local.type = tensor->type;
+                local.il = il;
+                local.n_head = kind == LLAMA_SPECTRAL_KIND_K ? hparams.n_head_kv(il) : hparams.n_head_kv(il);
+                local.head_dim = head_dim;
+                local.head_dim_padded = tensor->ne[0] / local.n_head;
+                local.is_key = kind == LLAMA_SPECTRAL_KIND_K;
+                local.prepared_entries.resize(local.n_head);
+                local.heads.resize(local.n_head);
+                local.head_meta.resize(local.n_head);
+                local.vec_norms.resize((size_t) n_rows_total * local.n_head, 0.0f);
+
+                uint32_t max_split = 0;
+                for (uint32_t h = 0; h < local.n_head; ++h) {
+                    const llama_spectral_entry * entry = find_spectral_kv_entry(
+                            spectral_artifact, kind, tensor->name, h, local.n_head, spectral_profile);
+                    if (entry == nullptr) {
+                        throw std::runtime_error(format("missing spectral calibration entry for %s head %u", tensor->name, h));
+                    }
+                    if (entry->dim != head_dim) {
+                        throw std::runtime_error(format("spectral calibration dim mismatch for %s head %u: %u != %u",
+                                tensor->name, h, entry->dim, head_dim));
+                    }
+
+                    std::string spectral_err;
+                    if (!llama_spectral_prepare_kv_entry(*entry, tensor->type, local.prepared_entries[h], &spectral_err)) {
+                        throw std::runtime_error(format("failed to prepare spectral KV entry for %s head %u: %s",
+                                tensor->name, h, spectral_err.c_str()));
+                    }
+
+                    local.use_correction = local.use_correction || local.prepared_entries[h].correction_dim > 0;
+                    max_split = std::max<uint32_t>(max_split, local.prepared_entries[h].split);
+                }
+
+                if (local.is_key && local.use_correction) {
+                    local.qjl_bytes_per_head = (max_split + 7u) / 8u;
+                    local.residual_norms.resize((size_t) n_rows_total * local.n_head, 0.0f);
+                    local.qjl_signs.resize((size_t) n_rows_total * local.n_head * local.qjl_bytes_per_head, 0);
+                }
+
+                for (uint32_t h = 0; h < local.n_head; ++h) {
+                    auto & prepared = local.prepared_entries[h];
+                    if (local.is_key && prepared.correction_dim > 0) {
+                        local.heads[h].qjl_matrix = build_spectral_qjl_matrix(prepared.dim, prepared.split);
+                    }
+
+                    local.head_meta[h] = ggml_spectral_kv_head_meta {
+                        /*.dim                    =*/ prepared.dim,
+                        /*.split                  =*/ prepared.split,
+                        /*.semantic_codebook_size =*/ (uint32_t) prepared.semantic_codebook.size(),
+                        /*.tail_codebook_size     =*/ (uint32_t) prepared.tail_codebook.size(),
+                        /*.basis                  =*/ prepared.basis.data(),
+                        /*.semantic_codebook      =*/ prepared.semantic_codebook.data(),
+                        /*.tail_codebook          =*/ prepared.tail_codebook.data(),
+                        /*.qjl_matrix             =*/ local.heads[h].qjl_matrix.empty() ? nullptr : local.heads[h].qjl_matrix.data(),
+                    };
+                }
+
+                spectral_kv_runtime.push_back(std::move(local));
+                auto & runtime = spectral_kv_runtime.back();
+                const ggml_spectral_kv_meta meta = {
+                    /*.is_key             =*/ runtime.is_key,
+                    /*.use_correction     =*/ runtime.use_correction,
+                    /*.n_head             =*/ runtime.n_head,
+                    /*.head_dim           =*/ runtime.head_dim,
+                    /*.head_dim_padded    =*/ runtime.head_dim_padded,
+                    /*.n_rows             =*/ n_rows_total,
+                    /*.qjl_bytes_per_head =*/ runtime.qjl_bytes_per_head,
+                    /*.heads              =*/ runtime.head_meta.data(),
+                    /*.vec_norms          =*/ runtime.vec_norms.data(),
+                    /*.residual_norms     =*/ runtime.residual_norms.empty() ? nullptr : runtime.residual_norms.data(),
+                    /*.qjl_signs          =*/ runtime.qjl_signs.empty() ? nullptr : runtime.qjl_signs.data(),
+                };
+
+                if (!ggml_spectral_kv_register_tensor(this, tensor->data, ggml_nbytes(tensor), tensor->type, &meta)) {
+                    throw std::runtime_error(format("failed to register spectral KV tensor %s", tensor->name));
+                }
+            };
+
+            register_tensor(layer.k, LLAMA_SPECTRAL_KIND_K, hparams.n_embd_head_k(il));
+            register_tensor(layer.v, LLAMA_SPECTRAL_KIND_V, hparams.n_embd_head_v(il));
+        }
+    }
+
     {
         const size_t memory_size_k = size_k_bytes();
         const size_t memory_size_v = size_v_bytes();
@@ -437,12 +665,14 @@ llama_kv_cache::llama_kv_cache(
 
     attn_rot_k =
         !attn_rot_disable &&
+        !uses_spectral_kv &&
         ggml_is_quantized(type_k) &&
         !hparams.is_n_embd_k_gqa_variable() &&
         hparams.n_embd_head_k() % 64 == 0;
 
     attn_rot_v =
         !attn_rot_disable &&
+        !uses_spectral_kv &&
         ggml_is_quantized(type_v) &&
         !hparams.is_n_embd_v_gqa_variable() &&
         hparams.n_embd_head_v() % 64 == 0;
@@ -475,6 +705,10 @@ llama_kv_cache::llama_kv_cache(
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
 }
 
+llama_kv_cache::~llama_kv_cache() {
+    ggml_spectral_kv_unregister_owner(this);
+}
+
 void llama_kv_cache::clear(bool data) {
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].reset();
@@ -498,6 +732,12 @@ void llama_kv_cache::clear(bool data) {
                 for (int i = 0; i < INNERQ_MAX_CHANNELS; i++) ones[i] = 1.0f;
                 ggml_backend_tensor_set(turbo_innerq_scale_inv, ones, 0, INNERQ_MAX_CHANNELS * sizeof(float));
             }
+        }
+
+        for (auto & runtime : spectral_kv_runtime) {
+            std::fill(runtime.vec_norms.begin(), runtime.vec_norms.end(), 0.0f);
+            std::fill(runtime.residual_norms.begin(), runtime.residual_norms.end(), 0.0f);
+            std::fill(runtime.qjl_signs.begin(), runtime.qjl_signs.end(), 0);
         }
     }
 }
@@ -1254,6 +1494,9 @@ bool llama_kv_cache::get_can_shift() const {
     if (model.arch == LLM_ARCH_STEP35) {
         return false;
     }
+    if (!spectral_kv_runtime.empty()) {
+        return false;
+    }
     if (hparams.n_pos_per_embd() > 1) {
         return false;
     }
@@ -1313,8 +1556,9 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
     const uint64_t n_embd_k_gqa = k->ne[0];
 
     // For turbo-padded caches, n_embd_k_gqa may be larger than hparams value
-    const bool k_is_turbo = (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0);
-    if (k_is_turbo) {
+    const bool k_is_turbo = llama_kv_type_is_turbo(k->type);
+    const bool k_is_skv = llama_kv_type_is_skv(k->type);
+    if (k_is_turbo || k_is_skv) {
         assert(n_embd_k_gqa >= hparams.n_embd_k_gqa(il));
     } else {
         assert(n_embd_k_gqa == hparams.n_embd_k_gqa(il));
@@ -1322,8 +1566,9 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
 
     // Use padded head_dim for turbo types so the full padded data is returned
     const uint32_t head_k = hparams.n_embd_head_k(il);
-    const uint32_t head_k_eff = (k_is_turbo && head_k % 128 != 0)
-        ? ((head_k + 127) / 128) * 128 : head_k;
+    const uint32_t head_k_eff = k_is_turbo && head_k % 128 != 0
+        ? ((head_k + 127) / 128) * 128
+        : (k_is_skv && head_k % LLAMA_SKV_BLOCK_SIZE != 0 ? GGML_PAD(head_k, LLAMA_SKV_BLOCK_SIZE) : head_k);
 
     const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
 
@@ -1347,10 +1592,12 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
     assert(n_embd_v_gqa >= hparams.n_embd_v_gqa(il));
 
     // Use padded head_dim for turbo types
-    const bool v_is_turbo = (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0);
+    const bool v_is_turbo = llama_kv_type_is_turbo(v->type);
+    const bool v_is_skv = llama_kv_type_is_skv(v->type);
     const uint32_t head_v = hparams.n_embd_head_v(il);
-    const uint32_t head_v_eff = (v_is_turbo && head_v % 128 != 0)
-        ? ((head_v + 127) / 128) * 128 : head_v;
+    const uint32_t head_v_eff = v_is_turbo && head_v % 128 != 0
+        ? ((head_v + 127) / 128) * 128
+        : (v_is_skv && head_v % LLAMA_SKV_BLOCK_SIZE != 0 ? GGML_PAD(head_v, LLAMA_SKV_BLOCK_SIZE) : head_v);
 
     const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
 
@@ -1387,10 +1634,12 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     // Turbo zero-padding: pad each head to next multiple of 128 before merging dims.
     // k_cur shape here is (n_embd_head, n_head, n_tokens).
     // ggml_pad pads ne[0] with zeros — exactly what we need per-head.
-    const bool k_is_turbo = (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0);
-    const bool k_needs_pad = k_is_turbo && (n_embd_head % 128 != 0);
+    const bool k_is_turbo = llama_kv_type_is_turbo(k->type);
+    const bool k_is_skv = llama_kv_type_is_skv(k->type);
+    const bool k_needs_pad = (k_is_turbo && (n_embd_head % 128 != 0)) || (k_is_skv && (n_embd_head % LLAMA_SKV_BLOCK_SIZE != 0));
     if (k_needs_pad) {
-        const int64_t pad_amount = ((n_embd_head + 127) / 128) * 128 - n_embd_head;
+        const int64_t padded = k_is_turbo ? ((n_embd_head + 127) / 128) * 128 : GGML_PAD(n_embd_head, LLAMA_SKV_BLOCK_SIZE);
+        const int64_t pad_amount = padded - n_embd_head;
         k_cur = ggml_pad(ctx, k_cur, pad_amount, 0, 0, 0);
         n_embd_head = k_cur->ne[0];  // now 128-aligned
     }
@@ -1440,10 +1689,12 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
     const int64_t n_tokens    = v_cur->ne[2];
 
     // Turbo zero-padding: pad V head_dim to next multiple of 128
-    const bool v_is_turbo = (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0);
-    const bool v_needs_pad = v_is_turbo && (n_embd_head % 128 != 0);
+    const bool v_is_turbo = llama_kv_type_is_turbo(v->type);
+    const bool v_is_skv = llama_kv_type_is_skv(v->type);
+    const bool v_needs_pad = (v_is_turbo && (n_embd_head % 128 != 0)) || (v_is_skv && (n_embd_head % LLAMA_SKV_BLOCK_SIZE != 0));
     if (v_needs_pad) {
-        const int64_t pad_amount = ((n_embd_head + 127) / 128) * 128 - n_embd_head;
+        const int64_t padded = v_is_turbo ? ((n_embd_head + 127) / 128) * 128 : GGML_PAD(n_embd_head, LLAMA_SKV_BLOCK_SIZE);
+        const int64_t pad_amount = padded - n_embd_head;
         v_cur = ggml_pad(ctx, v_cur, pad_amount, 0, 0, 0);
         n_embd_head = v_cur->ne[0];  // now 128-aligned
     }
@@ -2192,8 +2443,6 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
     // Iterate and write all the keys first, each row is a cell
     // Get whole range at a time
     for (const auto & layer : layers) {
-        const uint32_t il = layer.il;
-
         auto * k = layer.k_stream[cr.strm];
 
         // Use actual tensor width (may be padded for turbo types: e.g. 576→640)
@@ -2217,8 +2466,6 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
 
     if (!v_trans) {
         for (const auto & layer : layers) {
-            const uint32_t il = layer.il;
-
             auto * v = layer.v_stream[cr.strm];
             if (!v) {
                 continue;
@@ -2276,6 +2523,64 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
                     const size_t buf_size = range_size * v_size_el;
                     io.write_tensor(v, src_offset, buf_size);
                 }
+            }
+        }
+    }
+
+    state_write_spectral_data(io, cr);
+}
+
+void llama_kv_cache::state_write_spectral_data(llama_io_write_i & io, const cell_ranges_t & cr) const {
+    if (spectral_kv_runtime.empty()) {
+        return;
+    }
+
+    const uint32_t magic = LLAMA_SKV_STATE_MAGIC;
+    const uint32_t version = LLAMA_SKV_STATE_VERSION;
+    const uint32_t n_runtime = (uint32_t) spectral_kv_runtime.size();
+    const size_t row_base = (size_t) cr.strm * get_size();
+
+    io.write(&magic, sizeof(magic));
+    io.write(&version, sizeof(version));
+    io.write(&n_runtime, sizeof(n_runtime));
+
+    for (const auto & runtime : spectral_kv_runtime) {
+        const uint32_t il = runtime.il;
+        const uint32_t is_key = runtime.is_key ? 1u : 0u;
+        const uint32_t type_i = (uint32_t) runtime.type;
+        const uint32_t n_head = runtime.n_head;
+        const uint32_t head_dim = runtime.head_dim;
+        const uint32_t head_dim_padded = runtime.head_dim_padded;
+        const uint32_t use_correction = runtime.use_correction ? 1u : 0u;
+        const uint32_t qjl_bytes_per_head = runtime.qjl_bytes_per_head;
+
+        io.write(&il, sizeof(il));
+        io.write(&is_key, sizeof(is_key));
+        io.write(&type_i, sizeof(type_i));
+        io.write(&n_head, sizeof(n_head));
+        io.write(&head_dim, sizeof(head_dim));
+        io.write(&head_dim_padded, sizeof(head_dim_padded));
+        io.write(&use_correction, sizeof(use_correction));
+        io.write(&qjl_bytes_per_head, sizeof(qjl_bytes_per_head));
+
+        for (const auto & range : cr.data) {
+            const size_t range_size = range.second - range.first;
+            const size_t start = row_base + range.first;
+            io.write(runtime.vec_norms.data() + start * runtime.n_head, range_size * runtime.n_head * sizeof(float));
+        }
+
+        if (runtime.use_correction) {
+            for (const auto & range : cr.data) {
+                const size_t range_size = range.second - range.first;
+                const size_t start = row_base + range.first;
+                io.write(runtime.residual_norms.data() + start * runtime.n_head, range_size * runtime.n_head * sizeof(float));
+            }
+
+            for (const auto & range : cr.data) {
+                const size_t range_size = range.second - range.first;
+                const size_t start = row_base + range.first;
+                const size_t row_bytes = (size_t) runtime.n_head * runtime.qjl_bytes_per_head;
+                io.write(runtime.qjl_signs.data() + start * row_bytes, range_size * row_bytes);
             }
         }
     }
@@ -2566,6 +2871,120 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
                         }
                     }
                 }
+            }
+        }
+    }
+
+    return state_read_spectral_data(io, strm, cell_count, sinfo);
+}
+
+bool llama_kv_cache::state_read_spectral_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo) {
+    if (spectral_kv_runtime.empty()) {
+        return true;
+    }
+
+    uint32_t magic = 0;
+    uint32_t version = 0;
+    uint32_t n_runtime_ref = 0;
+
+    io.read_to(&magic, sizeof(magic));
+    io.read_to(&version, sizeof(version));
+    io.read_to(&n_runtime_ref, sizeof(n_runtime_ref));
+
+    if (magic != LLAMA_SKV_STATE_MAGIC || version != LLAMA_SKV_STATE_VERSION) {
+        LLAMA_LOG_ERROR("%s: invalid SKV state section (%08x, %u)\n", __func__, magic, version);
+        return false;
+    }
+
+    if (n_runtime_ref != spectral_kv_runtime.size()) {
+        LLAMA_LOG_ERROR("%s: mismatched SKV runtime count (%u != %zu)\n", __func__, n_runtime_ref, spectral_kv_runtime.size());
+        return false;
+    }
+
+    GGML_ASSERT(sinfo.n_stream() == 1);
+    const size_t row_base = (size_t) strm * get_size();
+
+    auto scatter_rows_f32 = [&](std::vector<float> & dst, uint32_t row_width) -> bool {
+        if (cell_count == 0) {
+            return true;
+        }
+
+        const size_t total = (size_t) cell_count * row_width;
+        if (sinfo.is_contiguous()) {
+            io.read_to(dst.data() + (row_base + sinfo.head()) * row_width, total * sizeof(float));
+            return true;
+        }
+
+        std::vector<float> tmp(total);
+        io.read_to(tmp.data(), total * sizeof(float));
+        for (uint32_t i = 0; i < cell_count; ++i) {
+            const size_t dst_row = row_base + sinfo.idxs[0][i];
+            std::memcpy(dst.data() + dst_row * row_width, tmp.data() + (size_t) i * row_width, row_width * sizeof(float));
+        }
+        return true;
+    };
+
+    auto scatter_rows_u8 = [&](std::vector<uint8_t> & dst, size_t row_width) -> bool {
+        if (cell_count == 0) {
+            return true;
+        }
+
+        const size_t total = (size_t) cell_count * row_width;
+        if (sinfo.is_contiguous()) {
+            io.read_to(dst.data() + (row_base + sinfo.head()) * row_width, total);
+            return true;
+        }
+
+        std::vector<uint8_t> tmp(total);
+        io.read_to(tmp.data(), total);
+        for (uint32_t i = 0; i < cell_count; ++i) {
+            const size_t dst_row = row_base + sinfo.idxs[0][i];
+            std::memcpy(dst.data() + dst_row * row_width, tmp.data() + (size_t) i * row_width, row_width);
+        }
+        return true;
+    };
+
+    for (auto & runtime : spectral_kv_runtime) {
+        uint32_t il_ref = 0;
+        uint32_t is_key_ref = 0;
+        uint32_t type_i_ref = 0;
+        uint32_t n_head_ref = 0;
+        uint32_t head_dim_ref = 0;
+        uint32_t head_dim_padded_ref = 0;
+        uint32_t use_correction_ref = 0;
+        uint32_t qjl_bytes_per_head_ref = 0;
+
+        io.read_to(&il_ref, sizeof(il_ref));
+        io.read_to(&is_key_ref, sizeof(is_key_ref));
+        io.read_to(&type_i_ref, sizeof(type_i_ref));
+        io.read_to(&n_head_ref, sizeof(n_head_ref));
+        io.read_to(&head_dim_ref, sizeof(head_dim_ref));
+        io.read_to(&head_dim_padded_ref, sizeof(head_dim_padded_ref));
+        io.read_to(&use_correction_ref, sizeof(use_correction_ref));
+        io.read_to(&qjl_bytes_per_head_ref, sizeof(qjl_bytes_per_head_ref));
+
+        if (il_ref != runtime.il ||
+            is_key_ref != (runtime.is_key ? 1u : 0u) ||
+            type_i_ref != (uint32_t) runtime.type ||
+            n_head_ref != runtime.n_head ||
+            head_dim_ref != runtime.head_dim ||
+            head_dim_padded_ref != runtime.head_dim_padded ||
+            use_correction_ref != (runtime.use_correction ? 1u : 0u) ||
+            qjl_bytes_per_head_ref != runtime.qjl_bytes_per_head) {
+            LLAMA_LOG_ERROR("%s: incompatible SKV runtime metadata while restoring state\n", __func__);
+            return false;
+        }
+
+        if (!scatter_rows_f32(runtime.vec_norms, runtime.n_head)) {
+            return false;
+        }
+
+        if (runtime.use_correction) {
+            if (!scatter_rows_f32(runtime.residual_norms, runtime.n_head)) {
+                return false;
+            }
+            if (!scatter_rows_u8(runtime.qjl_signs, (size_t) runtime.n_head * runtime.qjl_bytes_per_head)) {
+                return false;
             }
         }
     }

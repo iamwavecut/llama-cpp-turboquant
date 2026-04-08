@@ -766,6 +766,54 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_tq4_1s,
         .from_float_ref           = (ggml_from_float_t) quantize_row_tq4_1s_ref,
     },
+    [GGML_TYPE_SQ2_0] = {
+        .type_name                = "sq2_0",
+        .blck_size                = QK_SQ,
+        .type_size                = sizeof(block_sq2_0),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_sq2_0,
+        .from_float_ref           = NULL,
+    },
+    [GGML_TYPE_SQ3_1S] = {
+        .type_name                = "sq3_1s",
+        .blck_size                = QK_SQ,
+        .type_size                = sizeof(block_sq3_1s),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_sq3_1s,
+        .from_float_ref           = NULL,
+    },
+    [GGML_TYPE_SQ4_1S] = {
+        .type_name                = "sq4_1s",
+        .blck_size                = QK_SQ,
+        .type_size                = sizeof(block_sq4_1s),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_sq4_1s,
+        .from_float_ref           = NULL,
+    },
+    [GGML_TYPE_SKV2_0] = {
+        .type_name                = "skv2_0",
+        .blck_size                = QK_SKV,
+        .type_size                = sizeof(block_skv2_0),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_skv2_0,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_skv2_0_ref,
+    },
+    [GGML_TYPE_SKV3_0] = {
+        .type_name                = "skv3_0",
+        .blck_size                = QK_SKV,
+        .type_size                = sizeof(block_skv3_0),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_skv3_0,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_skv3_0_ref,
+    },
+    [GGML_TYPE_SKV4_0] = {
+        .type_name                = "skv4_0",
+        .blck_size                = QK_SKV,
+        .type_size                = sizeof(block_skv4_0),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_skv4_0,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_skv4_0_ref,
+    },
     [GGML_TYPE_Q2_K] = {
         .type_name                = "q2_K",
         .blck_size                = QK_K,
@@ -7754,6 +7802,11 @@ size_t ggml_quantize_chunk(
         case GGML_TYPE_TURBO2_0: result = quantize_turbo2_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_TQ3_1S:  result = quantize_tq3_1s(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_TQ4_1S:  result = quantize_tq4_1s(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_SKV2_0:
+        case GGML_TYPE_SKV3_0:
+        case GGML_TYPE_SKV4_0:
+            GGML_ABORT("%s: SKV quantization is runtime-only via ggml_set_rows", __func__);
+            break;
         case GGML_TYPE_F16:
             {
                 size_t elemsize = sizeof(ggml_fp16_t);

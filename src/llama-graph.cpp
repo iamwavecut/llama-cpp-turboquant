@@ -17,6 +17,8 @@
 #include <sstream>
 #include <unordered_set>
 
+static constexpr int64_t LLAMA_SKV_BLOCK_SIZE = 32;
+
 // dedup helpers
 
 static ggml_tensor * build_attn_inp_kq_mask(
@@ -69,6 +71,14 @@ static ggml_tensor * ggml_mul_mat_aux(
     res = ggml_reshape_4d(ctx, res, cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3]);
 
     return res;
+}
+
+static bool llama_graph_type_is_turbo(ggml_type type) {
+    return type == GGML_TYPE_TURBO3_0 || type == GGML_TYPE_TURBO4_0 || type == GGML_TYPE_TURBO2_0;
+}
+
+static bool llama_graph_type_is_skv(ggml_type type) {
+    return type == GGML_TYPE_SKV2_0 || type == GGML_TYPE_SKV3_0 || type == GGML_TYPE_SKV4_0;
 }
 
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
@@ -1884,8 +1894,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         // TurboQuant: inverse WHT on FA output when V values are WHT-rotated.
         // For MLA, V is a view of K with different ne[0] (e.g. V=512, K=576).
         // Group size must come from K (which determines the WHT rotation), not V.
-        if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0) {
-            const bool k_is_turbo = (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0);
+        if (llama_graph_type_is_turbo(v->type)) {
+            const bool k_is_turbo = llama_graph_type_is_turbo(k->type);
             const ggml_tensor * group_src = k_is_turbo ? k : v;
             const int turbo_group = (group_src->ne[0] % 128 == 0) ? 128 : 64;
             if (cur->ne[0] % turbo_group == 0) {
@@ -1962,8 +1972,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         cb(kqv, "kqv", il);
 
         // TurboQuant: inverse WHT on attention output (non-FA path)
-        if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0) {
-            const bool k_is_turbo = (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0);
+        if (llama_graph_type_is_turbo(v->type)) {
+            const bool k_is_turbo = llama_graph_type_is_turbo(k->type);
             const ggml_tensor * group_src = k_is_turbo ? k : v;
             const int turbo_group = (group_src->ne[0] % 128 == 0) ? 128 : 64;
             if (kqv->ne[0] % turbo_group == 0) {
@@ -2153,15 +2163,17 @@ ggml_tensor * llm_graph_context::build_attn(
     // TurboQuant pre-rotate-queries: O(d log d) WHT rotation via custom op
     // Q shape: (n_embd_head, n_head, n_tokens)
     // For zero-padded models (head_dim not 128-aligned), pad Q to match padded K dim first.
-    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0) {
-        // Pad Q per-head to next multiple of 128 if needed
-        if (q->ne[0] % 128 != 0) {
-            const int64_t pad = ((q->ne[0] + 127) / 128) * 128 - q->ne[0];
+    if (llama_graph_type_is_turbo(k->type) || llama_graph_type_is_skv(k->type)) {
+        const int64_t pad_multiple = llama_graph_type_is_turbo(k->type) ? 128 : LLAMA_SKV_BLOCK_SIZE;
+        if (q->ne[0] % pad_multiple != 0) {
+            const int64_t pad = GGML_PAD(q->ne[0], pad_multiple) - q->ne[0];
             q = ggml_pad(ctx0, q, pad, 0, 0, 0);
         }
-        if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
-        ggml_tensor * innerq_scale = mctx_cur->get_turbo_innerq_scale_inv();
-        q = ggml_turbo_wht(ctx0, q, 0, 0, innerq_scale);  // 0 = forward, 0 = auto group size from q->ne[0]
+        if (llama_graph_type_is_turbo(k->type)) {
+            if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
+            ggml_tensor * innerq_scale = mctx_cur->get_turbo_innerq_scale_inv();
+            q = ggml_turbo_wht(ctx0, q, 0, 0, innerq_scale);  // 0 = forward, 0 = auto group size from q->ne[0]
+        }
     }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
@@ -2169,7 +2181,7 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // TurboQuant: if V was padded, the output has padded dimensions.
     // Extract original V head_dim after inverse WHT (applied inside build_attn_mha).
-    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0) {
+    if (llama_graph_type_is_turbo(k->type) || llama_graph_type_is_skv(k->type)) {
         const int64_t orig_v_head = hparams.n_embd_head_v(il);
         // cur is 2D: (n_embd_head * n_head, n_tokens) after build_attn_mha
         const int64_t padded_v_head = v->ne[0];
@@ -2270,15 +2282,17 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // TurboQuant: pre-rotate Q for K-only (MLA) attention
     // For zero-padded models, pad Q to match padded K dim first.
-    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0) {
-        // Pad Q per-head to next multiple of 128 if needed
-        if (q->ne[0] % 128 != 0) {
-            const int64_t pad = ((q->ne[0] + 127) / 128) * 128 - q->ne[0];
+    if (llama_graph_type_is_turbo(k->type) || llama_graph_type_is_skv(k->type)) {
+        const int64_t pad_multiple = llama_graph_type_is_turbo(k->type) ? 128 : LLAMA_SKV_BLOCK_SIZE;
+        if (q->ne[0] % pad_multiple != 0) {
+            const int64_t pad = GGML_PAD(q->ne[0], pad_multiple) - q->ne[0];
             q = ggml_pad(ctx0, q, pad, 0, 0, 0);
         }
-        if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
-        ggml_tensor * innerq_scale = mctx_cur->get_turbo_innerq_scale_inv();
-        q = ggml_turbo_wht(ctx0, q, 0, 0, innerq_scale);  // 0 = forward, 0 = auto group size
+        if (llama_graph_type_is_turbo(k->type)) {
+            if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
+            ggml_tensor * innerq_scale = mctx_cur->get_turbo_innerq_scale_inv();
+            q = ggml_turbo_wht(ctx0, q, 0, 0, innerq_scale);  // 0 = forward, 0 = auto group size
+        }
     }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
@@ -2286,7 +2300,7 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // TurboQuant: if V was padded (MLA: V is view of K, may have padded dim),
     // extract original V head_dim after inverse WHT.
-    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0) {
+    if (llama_graph_type_is_turbo(k->type) || llama_graph_type_is_skv(k->type)) {
         const int64_t orig_v_head = v_cur->ne[0];  // original V head_dim from model
         const int64_t padded_v_head = v->ne[0];     // padded V head_dim in cache
         if (padded_v_head != orig_v_head) {
@@ -2378,21 +2392,24 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
     // TurboQuant: pre-rotate Q for ISWA attention (pad to 128-aligned if needed)
-    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0) {
-        if (q->ne[0] % 128 != 0) {
-            const int64_t pad = ((q->ne[0] + 127) / 128) * 128 - q->ne[0];
+    if (llama_graph_type_is_turbo(k->type) || llama_graph_type_is_skv(k->type)) {
+        const int64_t pad_multiple = llama_graph_type_is_turbo(k->type) ? 128 : LLAMA_SKV_BLOCK_SIZE;
+        if (q->ne[0] % pad_multiple != 0) {
+            const int64_t pad = GGML_PAD(q->ne[0], pad_multiple) - q->ne[0];
             q = ggml_pad(ctx0, q, pad, 0, 0, 0);
         }
-        if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
-        ggml_tensor * innerq_scale = mctx_cur->get_turbo_innerq_scale_inv();
-        q = ggml_turbo_wht(ctx0, q, 0, 0, innerq_scale);
+        if (llama_graph_type_is_turbo(k->type)) {
+            if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
+            ggml_tensor * innerq_scale = mctx_cur->get_turbo_innerq_scale_inv();
+            q = ggml_turbo_wht(ctx0, q, 0, 0, innerq_scale);
+        }
     }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
 
     // TurboQuant: if V was padded, extract original V head_dim after inverse WHT
-    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0) {
+    if (llama_graph_type_is_turbo(k->type) || llama_graph_type_is_skv(k->type)) {
         const int64_t orig_v_head = hparams.n_embd_head_v(il);
         const int64_t padded_v_head = v->ne[0];
         if (padded_v_head != orig_v_head) {

@@ -57,6 +57,9 @@ static std::string llama_model_ftype_name(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_TQ2_0:    return "TQ2_0 - 2.06 bpw ternary";
         case LLAMA_FTYPE_MOSTLY_TQ3_1S:   return "TQ3_1S - 4.0 bpw WHT-rotated 3-bit";
         case LLAMA_FTYPE_MOSTLY_TQ4_1S:   return "TQ4_1S - 5.0 bpw WHT-rotated 4-bit";
+        case LLAMA_FTYPE_MOSTLY_SQ2_0:    return "SQ2_0 - spectral 2-bit + correction";
+        case LLAMA_FTYPE_MOSTLY_SQ3_1S:   return "SQ3_1S - spectral 3-bit + correction";
+        case LLAMA_FTYPE_MOSTLY_SQ4_1S:   return "SQ4_1S - spectral 4-bit + correction";
         case LLAMA_FTYPE_MOSTLY_IQ2_XXS:  return "IQ2_XXS - 2.0625 bpw";
         case LLAMA_FTYPE_MOSTLY_IQ2_XS:   return "IQ2_XS - 2.3125 bpw";
         case LLAMA_FTYPE_MOSTLY_IQ2_S:    return "IQ2_S - 2.5 bpw";
@@ -752,6 +755,9 @@ llama_model_loader::llama_model_loader(
             case GGML_TYPE_TQ2_0:   ftype = LLAMA_FTYPE_MOSTLY_TQ2_0;   break;
             case GGML_TYPE_TQ3_1S:  ftype = LLAMA_FTYPE_MOSTLY_TQ3_1S;  break;
             case GGML_TYPE_TQ4_1S:  ftype = LLAMA_FTYPE_MOSTLY_TQ4_1S;  break;
+            case GGML_TYPE_SQ2_0:   ftype = LLAMA_FTYPE_MOSTLY_SQ2_0;   break;
+            case GGML_TYPE_SQ3_1S:  ftype = LLAMA_FTYPE_MOSTLY_SQ3_1S;  break;
+            case GGML_TYPE_SQ4_1S:  ftype = LLAMA_FTYPE_MOSTLY_SQ4_1S;  break;
             case GGML_TYPE_IQ2_XXS: ftype = LLAMA_FTYPE_MOSTLY_IQ2_XXS; break;
             case GGML_TYPE_IQ2_XS:  ftype = LLAMA_FTYPE_MOSTLY_IQ2_XS;  break;
             case GGML_TYPE_IQ2_S:   ftype = LLAMA_FTYPE_MOSTLY_IQ2_S;   break;

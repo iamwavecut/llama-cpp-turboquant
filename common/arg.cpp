@@ -390,6 +390,9 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_TURBO2_0,
     GGML_TYPE_TURBO3_0,
     GGML_TYPE_TURBO4_0,
+    GGML_TYPE_SKV2_0,
+    GGML_TYPE_SKV3_0,
+    GGML_TYPE_SKV4_0,
 };
 
 static ggml_type kv_cache_type_from_str(const std::string & s) {
@@ -2031,6 +2034,25 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.cache_type_v = kv_cache_type_from_str(value);
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
+    add_opt(common_arg(
+        {"--spectral-calibration"}, "FILE",
+        "spectral calibration GGUF sidecar for SKV cache types",
+        [](common_params & params, const std::string & value) {
+            params.spectral_calibration = value;
+        }
+    ).set_env("LLAMA_ARG_SPECTRAL_CALIBRATION"));
+    add_opt(common_arg(
+        {"--spectral-profile"}, "PROFILE",
+        string_format(
+            "spectral profile filter for SKV/SQ runtime\n"
+            "allowed values: auto, all, nonuniform, selcorr\n"
+            "(default: %s)",
+            params.spectral_profile.c_str()
+        ),
+        [](common_params & params, const std::string & value) {
+            params.spectral_profile = value;
+        }
+    ).set_env("LLAMA_ARG_SPECTRAL_PROFILE"));
     add_opt(common_arg(
         {"--hellaswag"},
         "compute HellaSwag score over random tasks from datafile supplied with -f",

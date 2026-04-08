@@ -12,11 +12,14 @@ class llama_batch_allocr;
 
 class llama_io_write_i;
 class llama_io_read_i;
+struct llama_spectral_artifact;
 
 struct llama_memory_params {
     // kv cache
     ggml_type type_k;
     ggml_type type_v;
+    const llama_spectral_artifact * spectral_kv = nullptr;
+    const char * spectral_profile = nullptr;
 
     // use full-size SWA cache
     bool swa_full;

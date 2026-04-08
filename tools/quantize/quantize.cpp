@@ -1,5 +1,6 @@
 #include "common.h"
 #include "llama.h"
+#include "llama-spectral.h"
 #include "gguf.h"
 
 #include <algorithm>
@@ -44,6 +45,9 @@ static const std::vector<quant_option> QUANT_OPTIONS = {
     { "TQ2_0",    LLAMA_FTYPE_MOSTLY_TQ2_0,    " 2.06 bpw ternarization",           },
     { "TQ3_1S",   LLAMA_FTYPE_MOSTLY_TQ3_1S,   " 4.00 bpw WHT-rotated",             },
     { "TQ4_1S",   LLAMA_FTYPE_MOSTLY_TQ4_1S,   " 5.00 bpw WHT-rotated",             },
+    { "SQ2_0",    LLAMA_FTYPE_MOSTLY_SQ2_0,    " 3.50 bpw spectral + correction",   },
+    { "SQ3_1S",   LLAMA_FTYPE_MOSTLY_SQ3_1S,   " 4.50 bpw spectral + correction",   },
+    { "SQ4_1S",   LLAMA_FTYPE_MOSTLY_SQ4_1S,   " 5.50 bpw spectral + correction",   },
     { "Q2_K",     LLAMA_FTYPE_MOSTLY_Q2_K,     " 2.96G, +3.5199 ppl @ Llama-3-8B",  },
     { "Q2_K_S",   LLAMA_FTYPE_MOSTLY_Q2_K_S,   " 2.96G, +3.1836 ppl @ Llama-3-8B",  },
     { "IQ3_XXS",  LLAMA_FTYPE_MOSTLY_IQ3_XXS,  " 3.06 bpw quantization",            },
@@ -75,6 +79,8 @@ static const char * const LLM_KV_QUANTIZE_IMATRIX_FILE       = "quantize.imatrix
 static const char * const LLM_KV_QUANTIZE_IMATRIX_DATASET    = "quantize.imatrix.dataset";
 static const char * const LLM_KV_QUANTIZE_IMATRIX_N_ENTRIES  = "quantize.imatrix.entries_count";
 static const char * const LLM_KV_QUANTIZE_IMATRIX_N_CHUNKS   = "quantize.imatrix.chunks_count";
+static const char * const LLM_KV_QUANTIZE_SPECTRAL_FILE      = "quantize.spectral.file";
+static const char * const LLM_KV_QUANTIZE_SPECTRAL_PROFILE   = "quantize.spectral.profile";
 
 // TODO: share with imatrix.cpp
 static const char * const LLM_KV_IMATRIX_DATASETS    = "imatrix.datasets";
@@ -123,7 +129,7 @@ static bool try_parse_ftype(const std::string & ftype_str_in, llama_ftype & ftyp
 [[noreturn]]
 static void usage(const char * executable) {
     printf("usage: %s [--help] [--allow-requantize] [--leave-output-tensor] [--pure] [--imatrix] [--include-weights]\n", executable);
-    printf("       [--exclude-weights] [--output-tensor-type] [--token-embedding-type] [--tensor-type] [--tensor-type-file]\n");
+    printf("       [--exclude-weights] [--spectral-calibration] [--spectral-profile] [--output-tensor-type] [--token-embedding-type] [--tensor-type] [--tensor-type-file]\n");
     printf("       [--prune-layers] [--keep-split] [--override-kv] [--dry-run]\n");
     printf("       model-f32.gguf [model-quant.gguf] type [nthreads]\n\n");
     printf("  --allow-requantize\n");
@@ -141,6 +147,11 @@ static void usage(const char * executable) {
     printf("                                      use importance matrix for this/these tensor(s)\n");
     printf("  --exclude-weights tensor_name\n");
     printf("                                      do not use importance matrix for this/these tensor(s)\n");
+    printf("  --spectral-calibration file_name\n");
+    printf("                                      use spectral calibration metadata from file_name during quantization\n");
+    printf("                                      runtime spectral metadata stays external unless already embedded in the input model\n");
+    printf("  --spectral-profile {all|auto|nonuniform|selcorr}\n");
+    printf("                                      optional spectral profile filter when using spectral metadata (default: all)\n");
     printf("  --output-tensor-type ggml_type\n");
     printf("                                      use this ggml_type for the output.weight tensor\n");
     printf("  --token-embedding-type ggml_type\n");
@@ -498,6 +509,8 @@ int main(int argc, char ** argv) {
 
     int arg_idx = 1;
     std::string imatrix_file;
+    std::string spectral_file;
+    std::string spectral_profile = "all";
     std::vector<std::string> included_weights, excluded_weights;
     std::vector<llama_model_kv_override> kv_overrides;
     std::vector<tensor_type_option> tensor_type_opts;
@@ -549,6 +562,24 @@ int main(int argc, char ** argv) {
         } else if (strcmp(argv[arg_idx], "--imatrix") == 0) {
             if (arg_idx < argc-1) {
                 imatrix_file = argv[++arg_idx];
+            } else {
+                usage(argv[0]);
+            }
+        } else if (strcmp(argv[arg_idx], "--spectral-calibration") == 0) {
+            if (arg_idx < argc-1) {
+                spectral_file = argv[++arg_idx];
+            } else {
+                usage(argv[0]);
+            }
+        } else if (strcmp(argv[arg_idx], "--spectral-profile") == 0) {
+            if (arg_idx < argc-1) {
+                spectral_profile = argv[++arg_idx];
+                if (spectral_profile != "all" && spectral_profile != "auto") {
+                    llama_spectral_profile parsed;
+                    if (!llama_spectral_profile_parse(spectral_profile, parsed)) {
+                        usage(argv[0]);
+                    }
+                }
             } else {
                 usage(argv[0]);
             }
@@ -621,6 +652,26 @@ int main(int argc, char ** argv) {
             std::strcpy(kvo.key, LLM_KV_QUANTIZE_IMATRIX_N_CHUNKS);
             kvo.tag = LLAMA_KV_OVERRIDE_TYPE_INT;
             kvo.val_i64 = m_last_call;
+            kv_overrides.emplace_back(std::move(kvo));
+        }
+    }
+    if (!spectral_file.empty()) {
+        params.spectral_calibration = spectral_file.c_str();
+        params.spectral_profile = spectral_profile.c_str();
+        {
+            llama_model_kv_override kvo;
+            std::strcpy(kvo.key, LLM_KV_QUANTIZE_SPECTRAL_FILE);
+            kvo.tag = LLAMA_KV_OVERRIDE_TYPE_STR;
+            strncpy(kvo.val_str, spectral_file.c_str(), 127);
+            kvo.val_str[127] = '\0';
+            kv_overrides.emplace_back(std::move(kvo));
+        }
+        {
+            llama_model_kv_override kvo;
+            std::strcpy(kvo.key, LLM_KV_QUANTIZE_SPECTRAL_PROFILE);
+            kvo.tag = LLAMA_KV_OVERRIDE_TYPE_STR;
+            strncpy(kvo.val_str, spectral_profile.c_str(), 127);
+            kvo.val_str[127] = '\0';
             kv_overrides.emplace_back(std::move(kvo));
         }
     }

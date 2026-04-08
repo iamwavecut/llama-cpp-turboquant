@@ -7,10 +7,13 @@
 #include "llama.h"
 #include "llama-hparams.h"
 #include "llama-model.h"
+#include "llama-spectral.h"
 #include "llama-vocab.h"
 
 #include <cstdint>
 #include <string>
+#include <stdexcept>
+#include <unordered_set>
 
 bool llama_model_saver_supports_arch(llm_arch arch) {
     switch (arch) {
@@ -376,6 +379,32 @@ void llama_model_saver::add_kv_from_model() {
     add_kv(LLM_KV_DENSE_2_FEAT_OUT,                  hparams.dense_2_feat_out);
     add_kv(LLM_KV_DENSE_3_FEAT_IN,                   hparams.dense_3_feat_in);
     add_kv(LLM_KV_DENSE_3_FEAT_OUT,                  hparams.dense_3_feat_out);
+
+    if (const auto * spectral = model->spectral_weights()) {
+        std::string spectral_err;
+        if (!llama_spectral_embed_gguf_metadata(*spectral, gguf_ctx, &spectral_err)) {
+            throw std::runtime_error("failed to persist spectral metadata: " + spectral_err);
+        }
+
+        const auto spectral_file = model->gguf_kv.find("quantize.spectral.file");
+        if (spectral_file != model->gguf_kv.end()) {
+            gguf_set_val_str(gguf_ctx, "quantize.spectral.file", spectral_file->second.c_str());
+        }
+
+        const auto spectral_profile = model->gguf_kv.find("quantize.spectral.profile");
+        if (spectral_profile != model->gguf_kv.end()) {
+            gguf_set_val_str(gguf_ctx, "quantize.spectral.profile", spectral_profile->second.c_str());
+        } else {
+            std::unordered_set<uint32_t> profiles;
+            for (const auto & entry : spectral->entries) {
+                profiles.insert(entry.profile);
+            }
+            gguf_set_val_str(gguf_ctx, "quantize.spectral.profile",
+                    profiles.size() == 1 ? llama_spectral_profile_name(spectral->entries.front().profile) : "all");
+        }
+
+        gguf_set_val_u32(gguf_ctx, "quantize.spectral.entries_count", spectral->entries.size());
+    }
 }
 
 void llama_model_saver::add_tensors_from_model() {

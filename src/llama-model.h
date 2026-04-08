@@ -17,6 +17,9 @@
 struct llama_cparams;
 struct llama_ubatch;
 struct llama_model_loader;
+struct llama_spectral_artifact;
+struct llama_spectral_entry;
+enum llama_spectral_profile : uint32_t;
 
 // available models
 enum llm_type {
@@ -579,6 +582,7 @@ struct llama_model {
     std::string desc() const;
 
     size_t size() const; // file size
+    size_t spectral_runtime_size() const;
     size_t n_tensors() const;
     size_t n_devices() const;
 
@@ -598,6 +602,10 @@ struct llama_model {
     ggml_backend_buffer_type_t select_buft(int il) const;
 
     bool has_tensor_overrides() const;
+    bool has_spectral_weights() const;
+    size_t n_spectral_weights() const;
+    const llama_spectral_artifact * spectral_weights() const;
+    const llama_spectral_entry * find_spectral_weight(const char * name, llama_spectral_profile profile) const;
 
     const struct ggml_tensor * get_tensor(const char * name) const;
 

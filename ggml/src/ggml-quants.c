@@ -5407,6 +5407,12 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
             break;
         case GGML_TYPE_TQ3_1S:
         case GGML_TYPE_TQ4_1S:
+        case GGML_TYPE_SQ2_0:
+        case GGML_TYPE_SQ3_1S:
+        case GGML_TYPE_SQ4_1S:
+        case GGML_TYPE_SKV2_0:
+        case GGML_TYPE_SKV3_0:
+        case GGML_TYPE_SKV4_0:
         case GGML_TYPE_TURBO3_0:
         case GGML_TYPE_TURBO4_0:
         case GGML_TYPE_TURBO2_0:

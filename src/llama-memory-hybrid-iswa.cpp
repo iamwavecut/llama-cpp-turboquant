@@ -13,6 +13,8 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
                             /* attn */
                 ggml_type   type_k,
                 ggml_type   type_v,
+    const llama_spectral_artifact * spectral_artifact,
+                  const char * spectral_profile,
                      bool   v_trans,
                      bool   swa_full,
                  uint32_t   kv_size,
@@ -34,6 +36,8 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
         model,
         type_k,
         type_v,
+        spectral_artifact,
+        spectral_profile,
         v_trans,
         offload,
         swa_full,

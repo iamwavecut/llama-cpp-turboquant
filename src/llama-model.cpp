@@ -5,6 +5,7 @@
 #include "llama-mmap.h"
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
+#include "llama-spectral.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -180,6 +181,21 @@ static llama_rope_scaling_type llama_rope_scaling_type_from_string(const std::st
     return LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED;
 }
 
+static bool llama_type_is_sq_weight(ggml_type type) {
+    return type == GGML_TYPE_SQ2_0 || type == GGML_TYPE_SQ3_1S || type == GGML_TYPE_SQ4_1S;
+}
+
+static void llama_spectral_strip_entry_payload(llama_spectral_entry & entry) {
+    entry.eigenvalues.clear();
+    entry.eigenvalues.shrink_to_fit();
+    entry.basis.clear();
+    entry.basis.shrink_to_fit();
+    entry.semantic_codebook.clear();
+    entry.semantic_codebook.shrink_to_fit();
+    entry.tail_codebook.clear();
+    entry.tail_codebook.shrink_to_fit();
+}
+
 // CPU: ACCEL -> GPU host -> CPU extra -> CPU
 static buft_list_t make_cpu_buft_list(const std::vector<ggml_backend_dev_t> & devices, bool use_extra_bufts, bool no_host) {
     buft_list_t buft_list;
@@ -288,6 +304,11 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
 }
 
 struct llama_model::impl {
+    struct spectral_runtime_entry {
+        ggml_type type = GGML_TYPE_COUNT;
+        llama_spectral_entry entry;
+    };
+
     impl() = default;
     ~impl() = default;
 
@@ -320,13 +341,27 @@ struct llama_model::impl {
     std::vector<layer_dev> dev_layer;
 
     bool has_tensor_overrides;
+
+    llama_spectral_artifact spectral_artifact;
+    bool spectral_artifact_embeddable = false;
+    std::unordered_multimap<std::string, size_t> spectral_weight_index;
+    std::string spectral_profile_filter;
+    std::vector<spectral_runtime_entry> spectral_runtime_entries;
+    size_t spectral_runtime_bytes = 0;
 };
+
+static size_t llama_spectral_runtime_entry_bytes(const llama_spectral_entry & entry) {
+    return sizeof(float) * entry.basis.size()
+        + sizeof(float) * entry.semantic_codebook.size()
+        + sizeof(float) * entry.tail_codebook.size();
+}
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
     pimpl->has_tensor_overrides = params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern;
 }
 
 llama_model::~llama_model() {
+    ggml_spectral_unregister_owner(this);
     for (auto * lora : loras) {
         delete lora;
     }
@@ -360,6 +395,104 @@ void llama_model::load_hparams(llama_model_loader & ml) {
 
     // get general kv
     ml.get_key(LLM_KV_GENERAL_NAME, name, false);
+
+    {
+        llama_spectral_artifact extracted;
+        std::string spectral_err;
+        if (!llama_spectral_extract_gguf_metadata(ctx, extracted, &spectral_err)) {
+            throw std::runtime_error("error loading spectral metadata: " + spectral_err);
+        }
+
+        llama_spectral_artifact sidecar_weights;
+        if (params.spectral_calibration != nullptr && params.spectral_calibration[0] != '\0') {
+            llama_spectral_artifact sidecar_all;
+            if (!llama_spectral_load_gguf(params.spectral_calibration, sidecar_all, &spectral_err)) {
+                throw std::runtime_error(format("error loading spectral sidecar '%s': %s",
+                        params.spectral_calibration, spectral_err.c_str()));
+            }
+            if (!sidecar_all.source_architecture.empty() && sidecar_all.source_architecture != arch_name()) {
+                throw std::runtime_error(format("spectral sidecar architecture mismatch: artifact=%s model=%s",
+                        sidecar_all.source_architecture.c_str(), arch_name().c_str()));
+            }
+            if (!llama_spectral_filter_artifact(sidecar_all, LLAMA_SPECTRAL_KIND_WEIGHT, "all", sidecar_weights, &spectral_err)) {
+                throw std::runtime_error("error filtering spectral sidecar metadata: " + spectral_err);
+            }
+        }
+
+        pimpl->spectral_artifact = {};
+        pimpl->spectral_artifact_embeddable = false;
+        pimpl->spectral_weight_index.clear();
+        pimpl->spectral_profile_filter.clear();
+        pimpl->spectral_runtime_entries.clear();
+        pimpl->spectral_runtime_bytes = 0;
+
+        const llama_spectral_artifact & source = !sidecar_weights.entries.empty() ? sidecar_weights : extracted;
+
+        if (!source.entries.empty()) {
+            if (!source.source_architecture.empty() && source.source_architecture != arch_name()) {
+                throw std::runtime_error(format("spectral metadata architecture mismatch: artifact=%s model=%s",
+                        source.source_architecture.c_str(), arch_name().c_str()));
+            }
+
+            llama_spectral_artifact filtered;
+            if (!llama_spectral_filter_artifact(source, LLAMA_SPECTRAL_KIND_WEIGHT, "all", filtered, &spectral_err)) {
+                throw std::runtime_error("error filtering spectral metadata: " + spectral_err);
+            }
+
+            std::string stored_profile;
+            if (ml.get_key("quantize.spectral.profile", stored_profile, false) &&
+                    stored_profile != "all" && stored_profile != "auto") {
+                llama_spectral_artifact requested;
+                if (!llama_spectral_filter_artifact(source, LLAMA_SPECTRAL_KIND_WEIGHT, stored_profile.c_str(), requested, &spectral_err)) {
+                    throw std::runtime_error("error validating spectral profile metadata: " + spectral_err);
+                }
+                if (requested.entries.empty()) {
+                    throw std::runtime_error(format("spectral profile '%s' is declared but no matching weight entries were embedded", stored_profile.c_str()));
+                }
+                pimpl->spectral_profile_filter = stored_profile;
+            }
+
+            if (params.spectral_profile != nullptr && params.spectral_profile[0] != '\0' &&
+                    std::string(params.spectral_profile) != "all" &&
+                    std::string(params.spectral_profile) != "auto") {
+                llama_spectral_artifact requested;
+                if (!llama_spectral_filter_artifact(source, LLAMA_SPECTRAL_KIND_WEIGHT, params.spectral_profile, requested, &spectral_err)) {
+                    throw std::runtime_error("error validating requested spectral profile metadata: " + spectral_err);
+                }
+                if (requested.entries.empty()) {
+                    throw std::runtime_error(format("requested spectral profile '%s' has no matching weight entries", params.spectral_profile));
+                }
+                pimpl->spectral_profile_filter = params.spectral_profile;
+            }
+
+            uint32_t expected_entries = 0;
+            if (sidecar_weights.entries.empty() &&
+                    ml.get_key("quantize.spectral.entries_count", expected_entries, false) &&
+                    expected_entries != filtered.entries.size()) {
+                throw std::runtime_error(format("spectral metadata entry count mismatch: declared=%u actual=%zu",
+                        expected_entries, filtered.entries.size()));
+            }
+
+            for (size_t i = 0; i < filtered.entries.size(); ++i) {
+                const auto & entry = filtered.entries[i];
+                const auto * tensor = ml.get_tensor_meta(entry.name.c_str());
+                if (tensor == nullptr) {
+                    throw std::runtime_error(format("spectral weight entry '%s' does not match any model tensor", entry.name.c_str()));
+                }
+                if (entry.dim != tensor->ne[0]) {
+                    throw std::runtime_error(format("spectral weight entry '%s' dimension mismatch: spectral=%u tensor=%lld",
+                            entry.name.c_str(), entry.dim, (long long) tensor->ne[0]));
+                }
+                if (ggml_nelements(tensor) % entry.dim != 0) {
+                    throw std::runtime_error(format("spectral weight entry '%s' is incompatible with tensor element count", entry.name.c_str()));
+                }
+                pimpl->spectral_weight_index.emplace(entry.name, i);
+            }
+
+            pimpl->spectral_artifact = std::move(filtered);
+            pimpl->spectral_artifact_embeddable = sidecar_weights.entries.empty();
+        }
+    }
 
     // everything past this point is not vocab-related
     // for CLIP models, we only need to load tensors, no hparams
@@ -7887,6 +8020,32 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    if (!pimpl->spectral_artifact.entries.empty() && !pimpl->spectral_artifact.source_digest.empty()) {
+        std::vector<const ggml_tensor *> model_tensors;
+        model_tensors.reserve(tensors_by_name.size());
+        for (const auto & [_, tensor] : tensors_by_name) {
+            model_tensors.push_back(tensor);
+        }
+
+        const std::string model_digest = llama_spectral_compute_tensor_digest(arch_name().c_str(), model_tensors);
+        if (model_digest != pimpl->spectral_artifact.source_digest) {
+            throw std::runtime_error(format("spectral metadata digest mismatch: artifact=%s model=%s",
+                    pimpl->spectral_artifact.source_digest.c_str(), model_digest.c_str()));
+        }
+    }
+
+    bool has_sq_weights = false;
+    for (const auto & [_, tensor] : tensors_by_name) {
+        if (llama_type_is_sq_weight(tensor->type)) {
+            has_sq_weights = true;
+            break;
+        }
+    }
+
+    if (has_sq_weights && n_gpu_layers > 0) {
+        throw std::runtime_error("SQ* spectral weights are CPU-only in this implementation; disable GPU offload");
+    }
+
     if (ml.no_alloc) {
         return true;
     }
@@ -7901,6 +8060,68 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
+        }
+    }
+
+    if (has_sq_weights) {
+        ggml_spectral_unregister_owner(this);
+        pimpl->spectral_runtime_entries.clear();
+        pimpl->spectral_runtime_bytes = 0;
+
+        llama_spectral_profile requested_profile = LLAMA_SPECTRAL_PROFILE_ROTATION_NONUNIFORM;
+        const bool have_requested_profile =
+                !pimpl->spectral_profile_filter.empty() &&
+                llama_spectral_profile_parse(pimpl->spectral_profile_filter, requested_profile);
+
+        for (const auto & [name, tensor] : tensors_by_name) {
+            if (!llama_type_is_sq_weight(tensor->type)) {
+                continue;
+            }
+
+            const llama_spectral_entry * entry = nullptr;
+            if (have_requested_profile) {
+                entry = find_spectral_weight(name.c_str(), requested_profile);
+            } else {
+                entry = find_spectral_weight(name.c_str(), LLAMA_SPECTRAL_PROFILE_ROTATION_NONUNIFORM_SELCORR);
+                if (entry == nullptr) {
+                    entry = find_spectral_weight(name.c_str(), LLAMA_SPECTRAL_PROFILE_ROTATION_NONUNIFORM);
+                }
+            }
+
+            if (entry == nullptr) {
+                throw std::runtime_error(format("missing spectral runtime metadata for SQ tensor %s", name.c_str()));
+            }
+
+            std::string spectral_err;
+            llama_spectral_entry prepared;
+            if (!llama_spectral_prepare_weight_entry(*entry, tensor->type, prepared, &spectral_err)) {
+                throw std::runtime_error(format("failed to prepare spectral runtime metadata for %s: %s",
+                        name.c_str(), spectral_err.c_str()));
+            }
+
+            pimpl->spectral_runtime_entries.push_back({ tensor->type, std::move(prepared) });
+            const auto & runtime = pimpl->spectral_runtime_entries.back();
+            pimpl->spectral_runtime_bytes += llama_spectral_runtime_entry_bytes(runtime.entry);
+            const ggml_spectral_weight_meta meta = {
+                /*.dim                    =*/ runtime.entry.dim,
+                /*.split                  =*/ runtime.entry.split,
+                /*.correction_dim         =*/ runtime.entry.correction_dim,
+                /*.semantic_codebook_size =*/ (uint32_t) runtime.entry.semantic_codebook.size(),
+                /*.tail_codebook_size     =*/ (uint32_t) runtime.entry.tail_codebook.size(),
+                /*.basis                  =*/ runtime.entry.basis.data(),
+                /*.semantic_codebook      =*/ runtime.entry.semantic_codebook.data(),
+                /*.tail_codebook          =*/ runtime.entry.tail_codebook.data(),
+            };
+
+            if (!ggml_spectral_register_tensor(this, tensor->data, ggml_nbytes(tensor), tensor->type, &meta)) {
+                throw std::runtime_error(format("failed to register SQ tensor runtime metadata for %s", name.c_str()));
+            }
+        }
+
+        if (!pimpl->spectral_artifact_embeddable) {
+            for (auto & entry : pimpl->spectral_artifact.entries) {
+                llama_spectral_strip_entry_payload(entry);
+            }
         }
     }
 
@@ -7921,6 +8142,10 @@ std::string llama_model::desc() const {
 
 size_t llama_model::size() const {
     return pimpl->n_bytes;
+}
+
+size_t llama_model::spectral_runtime_size() const {
+    return pimpl->spectral_runtime_bytes;
 }
 
 size_t llama_model::n_tensors() const {
@@ -8088,6 +8313,30 @@ void llama_model::print_info() const {
     // general kv
     LLAMA_LOG_INFO("%s: general.name          = %s\n",    __func__, name.c_str());
 
+    if (!pimpl->spectral_artifact.entries.empty()) {
+        std::string profiles;
+        std::unordered_set<uint32_t> seen_profiles;
+        for (const auto & entry : pimpl->spectral_artifact.entries) {
+            if (!seen_profiles.insert(entry.profile).second) {
+                continue;
+            }
+            const std::string profile_name = llama_spectral_profile_name(entry.profile);
+            if (!profiles.empty()) {
+                profiles += ", ";
+            }
+            profiles += profile_name;
+        }
+
+        LLAMA_LOG_INFO("%s: spectral weights      = %zu\n", __func__, pimpl->spectral_artifact.entries.size());
+        LLAMA_LOG_INFO("%s: spectral profiles     = %s\n", __func__, profiles.c_str());
+        if (!pimpl->spectral_artifact.source_digest.empty()) {
+            LLAMA_LOG_INFO("%s: spectral digest       = %s\n", __func__, pimpl->spectral_artifact.source_digest.c_str());
+        }
+        if (pimpl->spectral_runtime_bytes > 0) {
+            LLAMA_LOG_INFO("%s: spectral runtime heap = %.2f MiB\n", __func__, pimpl->spectral_runtime_bytes / 1024.0 / 1024.0);
+        }
+    }
+
     if (arch == LLM_ARCH_DEEPSEEK) {
         LLAMA_LOG_INFO("%s: n_layer_dense_lead    = %d\n",     __func__, hparams.n_layer_dense_lead);
         LLAMA_LOG_INFO("%s: n_ff_exp              = %d\n",     __func__, hparams.n_ff_exp);
@@ -8224,6 +8473,37 @@ bool llama_model::has_tensor_overrides() const {
     return pimpl->has_tensor_overrides;
 }
 
+bool llama_model::has_spectral_weights() const {
+    return !pimpl->spectral_artifact.entries.empty();
+}
+
+size_t llama_model::n_spectral_weights() const {
+    return pimpl->spectral_artifact.entries.size();
+}
+
+const llama_spectral_artifact * llama_model::spectral_weights() const {
+    if (pimpl->spectral_artifact.entries.empty() || !pimpl->spectral_artifact_embeddable) {
+        return nullptr;
+    }
+    return &pimpl->spectral_artifact;
+}
+
+const llama_spectral_entry * llama_model::find_spectral_weight(const char * name, llama_spectral_profile profile) const {
+    if (name == nullptr) {
+        return nullptr;
+    }
+
+    const auto range = pimpl->spectral_weight_index.equal_range(name);
+    for (auto it = range.first; it != range.second; ++it) {
+        const auto & entry = pimpl->spectral_artifact.entries[it->second];
+        if (entry.profile == profile) {
+            return &entry;
+        }
+    }
+
+    return nullptr;
+}
+
 const ggml_tensor * llama_model::get_tensor(const char * name) const {
     auto it = std::find_if(tensors_by_name.begin(), tensors_by_name.end(),
             [name](const std::pair<std::string, ggml_tensor *> & it) {
@@ -8318,6 +8598,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* model             */ *this,
                             /* attn_type_k       */ params.type_k,
                             /* attn_type_v       */ params.type_v,
+                            /* spectral_artifact */ params.spectral_kv,
+                            /* spectral_profile  */ params.spectral_profile,
                             /* attn_v_trans      */ !cparams.flash_attn,
                             /* attn_swa_full     */ params.swa_full,
                             /* attn_kv_size      */ cparams.n_ctx_seq,
@@ -8336,6 +8618,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* model             */ *this,
                             /* attn_type_k       */ params.type_k,
                             /* attn_type_v       */ params.type_v,
+                            /* spectral_artifact */ params.spectral_kv,
+                            /* spectral_profile  */ params.spectral_profile,
                             /* attn_v_trans      */ !cparams.flash_attn,
                             /* attn_kv_size      */ cparams.n_ctx_seq,
                             /* attn_n_pad        */ 1,
@@ -8370,6 +8654,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 *this,
                                 params.type_k,
                                 params.type_v,
+                                params.spectral_kv,
+                                params.spectral_profile,
                                 !cparams.flash_attn,
                                 cparams.offload_kqv,
                                 params.swa_full,
@@ -8387,6 +8673,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 *this,
                                 params.type_k,
                                 params.type_v,
+                                params.spectral_kv,
+                                params.spectral_profile,
                                 !cparams.flash_attn,
                                 cparams.offload_kqv,
                                 cparams.kv_unified,
@@ -8946,6 +9234,8 @@ llama_model_params llama_model_default_params() {
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
+        /*.spectral_calibration        =*/ nullptr,
+        /*.spectral_profile            =*/ nullptr,
         /*.vocab_only                  =*/ false,
         /*.use_mmap                    =*/ true,
         /*.use_direct_io               =*/ false,
@@ -9252,6 +9542,10 @@ int32_t llama_model_desc(const llama_model * model, char * buf, size_t buf_size)
 
 uint64_t llama_model_size(const llama_model * model) {
     return model->size();
+}
+
+uint64_t llama_model_spectral_runtime_size(const llama_model * model) {
+    return model ? model->spectral_runtime_size() : 0;
 }
 
 const char * llama_model_chat_template(const llama_model * model, const char * name) {

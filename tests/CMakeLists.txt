@@ -197,6 +197,11 @@ llama_build_and_test(test-chat-auto-parser.cpp WORKING_DIRECTORY ${PROJECT_SOURC
 llama_build_and_test(test-chat-template.cpp)
 llama_build_and_test(test-json-partial.cpp)
 llama_build_and_test(test-log.cpp)
+llama_build_and_test(test-spectral-quant.cpp)
+target_include_directories(test-spectral-quant PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_include_directories(test-spectral-quant PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+llama_build_and_test(test-spectral-kv-state.cpp)
+target_include_directories(test-spectral-kv-state PRIVATE ${PROJECT_SOURCE_DIR}/src)
 llama_build_and_test(
     test-peg-parser.cpp
     peg-parser/simple-tokenize.cpp
@@ -226,6 +231,18 @@ add_test(NAME test-download-model COMMAND ${CMAKE_COMMAND}
     -P ${CMAKE_SOURCE_DIR}/cmake/download-models.cmake
 )
 set_tests_properties(test-download-model PROPERTIES FIXTURES_SETUP test-download-model)
+
+llama_build_and_test(test-spectral-acceptance.cpp ARGS "${MODEL_DEST}")
+target_include_directories(test-spectral-acceptance PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_compile_definitions(test-spectral-acceptance PRIVATE
+    LLAMA_PROJECT_SOURCE_DIR="${PROJECT_SOURCE_DIR}"
+    LLAMA_PROJECT_BINARY_DIR="${PROJECT_BINARY_DIR}")
+add_dependencies(test-spectral-acceptance
+    llama-bench
+    llama-perplexity
+    llama-spectral-calibrate
+    llama-quantize)
+set_tests_properties(test-spectral-acceptance PROPERTIES FIXTURES_REQUIRED test-download-model LABELS "model")
 
 llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "The meaning of life is" -n 128 -c 256 -ub 32 -np 4 -t 2)
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)

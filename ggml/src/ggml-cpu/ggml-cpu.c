@@ -221,6 +221,24 @@ static void ggml_vec_dot_tq3_1s_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
 static void ggml_vec_dot_tq4_1s_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
                                        const void * GGML_RESTRICT vx, size_t bx,
                                        const void * GGML_RESTRICT vy, size_t by, int nrc);
+static void ggml_vec_dot_sq2_0_f32(int n, float * GGML_RESTRICT s, size_t bs,
+                                       const void * GGML_RESTRICT vx, size_t bx,
+                                       const void * GGML_RESTRICT vy, size_t by, int nrc);
+static void ggml_vec_dot_sq3_1s_f32(int n, float * GGML_RESTRICT s, size_t bs,
+                                       const void * GGML_RESTRICT vx, size_t bx,
+                                       const void * GGML_RESTRICT vy, size_t by, int nrc);
+static void ggml_vec_dot_sq4_1s_f32(int n, float * GGML_RESTRICT s, size_t bs,
+                                       const void * GGML_RESTRICT vx, size_t bx,
+                                       const void * GGML_RESTRICT vy, size_t by, int nrc);
+void ggml_vec_dot_skv2_0_f32(int n, float * GGML_RESTRICT s, size_t bs,
+                             const void * GGML_RESTRICT vx, size_t bx,
+                             const void * GGML_RESTRICT vy, size_t by, int nrc);
+void ggml_vec_dot_skv3_0_f32(int n, float * GGML_RESTRICT s, size_t bs,
+                             const void * GGML_RESTRICT vx, size_t bx,
+                             const void * GGML_RESTRICT vy, size_t by, int nrc);
+void ggml_vec_dot_skv4_0_f32(int n, float * GGML_RESTRICT s, size_t bs,
+                             const void * GGML_RESTRICT vx, size_t bx,
+                             const void * GGML_RESTRICT vy, size_t by, int nrc);
 
 static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_F32] = {
@@ -439,6 +457,42 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .from_float               = (ggml_from_float_t) quantize_row_tq4_1s_ref,
         .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_tq4_1s_q8_0,
         .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_SQ2_0] = {
+        .from_float               = NULL,
+        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_sq2_0_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_SQ3_1S] = {
+        .from_float               = NULL,
+        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_sq3_1s_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_SQ4_1S] = {
+        .from_float               = NULL,
+        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_sq4_1s_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_SKV2_0] = {
+        .from_float               = (ggml_from_float_t) quantize_row_skv2_0_ref,
+        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_skv2_0_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_SKV3_0] = {
+        .from_float               = (ggml_from_float_t) quantize_row_skv3_0_ref,
+        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_skv3_0_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_SKV4_0] = {
+        .from_float               = (ggml_from_float_t) quantize_row_skv4_0_ref,
+        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_skv4_0_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
         .nrows                    = 1,
     },
 };
@@ -1296,6 +1350,10 @@ void ggml_compute_forward_mul_mat(
     ggml_from_float_t        const from_float           = type_traits_cpu[vec_dot_type].from_float;
     int64_t                  const vec_dot_num_rows     = type_traits_cpu[src0->type].nrows;
 
+    if (ggml_is_spectral_weight_type(src0->type)) {
+        ggml_sq_vec_cache_reset();
+    }
+
     GGML_ASSERT(ne0 == ne01);
     GGML_ASSERT(ne1 == ne11);
     GGML_ASSERT(ne2 == ne12);
@@ -1573,6 +1631,10 @@ static void ggml_compute_forward_mul_mat_id(
 
     enum ggml_type    const vec_dot_type    = type_traits_cpu[type].vec_dot_type;
     ggml_from_float_t const from_float      = type_traits_cpu[vec_dot_type].from_float;
+
+    if (ggml_is_spectral_weight_type(type)) {
+        ggml_sq_vec_cache_reset();
+    }
 
     // we don't support permuted src0 or src1
     GGML_ASSERT(nb00 == ggml_type_size(type));
@@ -3480,6 +3542,75 @@ static void ggml_vec_dot_tq4_1s_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
     }
     free(tmp);
     free(tmp2);
+    *s = sum;
+}
+
+static void ggml_vec_dot_sq2_0_f32(int n, float * GGML_RESTRICT s, size_t bs,
+                                      const void * GGML_RESTRICT vx, size_t bx,
+                                      const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    GGML_ASSERT(nrc == 1);
+    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);
+
+    if (ggml_sq_vec_dot_f32(GGML_TYPE_SQ2_0, vx, (const float *) vy, n, s)) {
+        return;
+    }
+
+    float * tmp = (float *) malloc((size_t) n * sizeof(float));
+    GGML_ASSERT(tmp != NULL);
+    ggml_get_type_traits(GGML_TYPE_SQ2_0)->to_float(vx, tmp, n);
+
+    const float * y = (const float *) vy;
+    float sum = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        sum += tmp[i] * y[i];
+    }
+    free(tmp);
+    *s = sum;
+}
+
+static void ggml_vec_dot_sq3_1s_f32(int n, float * GGML_RESTRICT s, size_t bs,
+                                       const void * GGML_RESTRICT vx, size_t bx,
+                                       const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    GGML_ASSERT(nrc == 1);
+    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);
+
+    if (ggml_sq_vec_dot_f32(GGML_TYPE_SQ3_1S, vx, (const float *) vy, n, s)) {
+        return;
+    }
+
+    float * tmp = (float *) malloc((size_t) n * sizeof(float));
+    GGML_ASSERT(tmp != NULL);
+    ggml_get_type_traits(GGML_TYPE_SQ3_1S)->to_float(vx, tmp, n);
+
+    const float * y = (const float *) vy;
+    float sum = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        sum += tmp[i] * y[i];
+    }
+    free(tmp);
+    *s = sum;
+}
+
+static void ggml_vec_dot_sq4_1s_f32(int n, float * GGML_RESTRICT s, size_t bs,
+                                       const void * GGML_RESTRICT vx, size_t bx,
+                                       const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    GGML_ASSERT(nrc == 1);
+    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);
+
+    if (ggml_sq_vec_dot_f32(GGML_TYPE_SQ4_1S, vx, (const float *) vy, n, s)) {
+        return;
+    }
+
+    float * tmp = (float *) malloc((size_t) n * sizeof(float));
+    GGML_ASSERT(tmp != NULL);
+    ggml_get_type_traits(GGML_TYPE_SQ4_1S)->to_float(vx, tmp, n);
+
+    const float * y = (const float *) vy;
+    float sum = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        sum += tmp[i] * y[i];
+    }
+    free(tmp);
     *s = sum;
 }
 
