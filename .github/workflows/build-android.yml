@@ -39,7 +39,7 @@ jobs:
 
     steps:
       - name: Clone
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           lfs: false
@@ -51,7 +51,7 @@ jobs:
           distribution: zulu
 
       - name: Setup Android SDK
-        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
+        uses: android-actions/setup-android@v4 # v3
         with:
           log-accepted-android-sdk-licenses: false
 
@@ -78,7 +78,7 @@ jobs:
     steps:
       - name: Clone
         id: checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           lfs: false
@@ -95,7 +95,7 @@ jobs:
 
       - name: Upload Llama.CPP Hexagon Android Build Artifact
         if: ${{ always() && steps.build_llama_cpp_hexagon_android.outcome == 'success' }}
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: llama-cpp-android-${{ matrix.build }}
           path: pkg-adb/llama.cpp
